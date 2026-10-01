@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -666,6 +667,30 @@ def make_batch_figures(curves: dict):
     return fig1, fig2, fig3
 
 
+
+def figure_to_png_bytes(fig: Figure, dpi: int = 300) -> bytes:
+    """Matplotlib Figure를 고해상도 PNG bytes로 변환합니다."""
+    output = io.BytesIO()
+    fig.savefig(output, format="png", dpi=dpi, bbox_inches="tight")
+    output.seek(0)
+    return output.getvalue()
+
+
+def build_figures_zip(figures, file_names: list[str], dpi: int = 300) -> bytes:
+    """여러 Figure를 PNG로 변환하여 하나의 ZIP 파일로 묶습니다."""
+    if len(figures) != len(file_names):
+        raise ValueError("그래프 개수와 파일 이름 개수가 일치하지 않습니다.")
+
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for fig, file_name in zip(figures, file_names):
+            png_bytes = figure_to_png_bytes(fig, dpi=dpi)
+            zf.writestr(file_name, png_bytes)
+
+    output.seek(0)
+    return output.getvalue()
+
+
 def build_single_excel(
     file_name: str,
     sheet_name: str,
@@ -918,6 +943,18 @@ with tab_single:
                         tox_nm=float(single_tox),
                         use_abs_id=single_abs,
                     )
+
+                    single_stem = Path(single_file.name).stem
+                    graph_zip_bytes = build_figures_zip(
+                        figs,
+                        [
+                            f"{single_stem}_Linear_Id_Vg.png",
+                            f"{single_stem}_Log_Id_Ig_Vg.png",
+                            f"{single_stem}_gm_Vg.png",
+                        ],
+                        dpi=300,
+                    )
+
                     st.session_state.single_payload = {
                         "file_name": single_file.name,
                         "sheet": single_sheet,
@@ -927,6 +964,7 @@ with tab_single:
                         "header_row": header_row,
                         "figs": figs,
                         "excel": excel_bytes,
+                        "graph_zip": graph_zip_bytes,
                     }
             except Exception as e:
                 st.session_state.single_payload = None
@@ -963,13 +1001,27 @@ with tab_single:
             st.pyplot(single_payload["figs"][2], use_container_width=True)
 
         stem = Path(single_payload["file_name"]).stem
-        st.download_button(
-            "결과 Excel 다운로드",
-            data=single_payload["excel"],
-            file_name=f"{stem}_TFT_analysis.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="single_download",
-        )
+        dl1, dl2 = st.columns(2)
+
+        with dl1:
+            st.download_button(
+                "결과 Excel 다운로드",
+                data=single_payload["excel"],
+                file_name=f"{stem}_TFT_analysis.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="single_download",
+                use_container_width=True,
+            )
+
+        with dl2:
+            st.download_button(
+                "그래프 이미지 다운로드",
+                data=single_payload["graph_zip"],
+                file_name=f"{stem}_TFT_graphs.zip",
+                mime="application/zip",
+                key="single_graph_download",
+                use_container_width=True,
+            )
 
 
 # ------------------------- Batch -----------------------------
@@ -1081,12 +1133,24 @@ with tab_batch:
                     col_ig=batch_ig.strip(),
                     col_vd=batch_vd.strip(),
                 )
+
+                graph_zip_bytes = build_figures_zip(
+                    figs,
+                    [
+                        "TFT_Batch_Linear_Id_Overlay.png",
+                        "TFT_Batch_Log_Id_Ig_Overlay.png",
+                        "TFT_Batch_gm_Overlay.png",
+                    ],
+                    dpi=300,
+                )
+
                 st.session_state.batch_payload = {
                     "results": result_df,
                     "errors": errors_df,
                     "curves": curves,
                     "figs": figs,
                     "excel": excel_bytes,
+                    "graph_zip": graph_zip_bytes,
                     "detected": pd.DataFrame(detected_sheets),
                 }
             else:
@@ -1096,6 +1160,7 @@ with tab_batch:
                     "curves": {},
                     "figs": None,
                     "excel": None,
+                    "graph_zip": None,
                     "detected": pd.DataFrame(detected_sheets),
                 }
 
@@ -1156,13 +1221,27 @@ with tab_batch:
             with bp3:
                 st.pyplot(batch_payload["figs"][2], use_container_width=True)
 
-            st.download_button(
-                "Batch 결과 Excel 다운로드",
-                data=batch_payload["excel"],
-                file_name="TFT_Batch_Analysis.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="batch_download",
-            )
+            bdl1, bdl2 = st.columns(2)
+
+            with bdl1:
+                st.download_button(
+                    "Batch 결과 Excel 다운로드",
+                    data=batch_payload["excel"],
+                    file_name="TFT_Batch_Analysis.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="batch_download",
+                    use_container_width=True,
+                )
+
+            with bdl2:
+                st.download_button(
+                    "Batch 그래프 이미지 다운로드",
+                    data=batch_payload["graph_zip"],
+                    file_name="TFT_Batch_Graphs.zip",
+                    mime="application/zip",
+                    key="batch_graph_download",
+                    use_container_width=True,
+                )
 
         if failed:
             with st.expander(f"분석 실패 파일 {failed}개"):
