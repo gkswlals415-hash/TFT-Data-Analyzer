@@ -202,6 +202,11 @@ def analyze_sweep(
     vg = data["Vg"].to_numpy(dtype=float)
     ids = data["Id_smooth"].to_numpy(dtype=float)
 
+    # Vg sweep step: median of non-zero adjacent voltage differences
+    vg_diffs = np.abs(np.diff(vg))
+    vg_diffs = vg_diffs[np.isfinite(vg_diffs) & (vg_diffs > 0)]
+    vg_step = float(np.nanmedian(vg_diffs)) if len(vg_diffs) else np.nan
+
     # gm
     gm = np.gradient(ids, vg)
     data["gm"] = gm
@@ -283,6 +288,7 @@ def analyze_sweep(
         "Ion_A": ion,
         "Ioff_A": ioff,
         "On_Off": onoff,
+        "Vg_Step_V": vg_step,
         "Smoothing_Window": win,
         "SS_Window": ss_window,
         "gm_index": idx,
@@ -466,6 +472,7 @@ def analyze_batch_file(
         "muFE R (cm2/Vs)": r["mu_FE_cm2_Vs"],
         "ON/OFF F": f["On_Off"],
         "ON/OFF R": r["On_Off"],
+        "Vg step (V)": float(np.nanmedian([f["Vg_Step_V"], r["Vg_Step_V"]])),
         "Vg@gmmax F (V)": f["Vg_at_gmmax_V"],
         "Vg@gmmax R (V)": r["Vg_at_gmmax_V"],
         "Id@gmmax F (A)": f["Id_at_gmmax_A"],
@@ -512,6 +519,7 @@ def single_results_dataframe(results: dict) -> pd.DataFrame:
             "Vg @ gm_max (V)": r["Vg_at_gmmax_V"],
             "Id @ gm_max (A)": r["Id_at_gmmax_A"],
             "ON/OFF": r["On_Off"],
+            "Vg step (V)": r["Vg_Step_V"],
             "Vd used (V)": r["Vd_used_V"],
             "Cox (F/cm²)": r["Cox_F_cm2"],
         })
@@ -728,6 +736,7 @@ def build_single_excel(
             "Vth (V)": r["Vth_V"],
             "Mobility μFE (cm2/Vs)": r["mu_FE_cm2_Vs"],
             "Cox (F/cm2)": r["Cox_F_cm2"],
+            "Vg step (V)": r["Vg_Step_V"],
             "Vd used (V)": r["Vd_used_V"],
             "W (um)": W_um,
             "L (um)": L_um,
@@ -776,6 +785,7 @@ def statistics_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         "muFE R (cm2/Vs)",
         "ON/OFF F",
         "ON/OFF R",
+        "Vg step (V)",
     ]
     rows = []
     for metric in metrics:
@@ -1016,6 +1026,7 @@ with tab_single:
             "SS (mV/dec)": 2,
             "μFE (cm²/V·s)": 3,
             "Vg @ gm_max (V)": 3,
+            "Vg step (V)": 3,
             "Vd used (V)": 3,
         }
         for col, decimals in single_fixed_formats.items():
@@ -1221,6 +1232,7 @@ with tab_batch:
                 "SS F (mV/dec)", "SS R (mV/dec)",
                 "muFE F (cm2/Vs)", "muFE R (cm2/Vs)",
                 "ON/OFF F", "ON/OFF R",
+                "Vg step (V)",
             ]
             avg = result_df[numeric_cols].apply(pd.to_numeric, errors="coerce").mean()
 
@@ -1244,6 +1256,7 @@ with tab_batch:
                 "SS F (mV/dec)", "SS R (mV/dec)",
                 "muFE F (cm2/Vs)", "muFE R (cm2/Vs)",
                 "ON/OFF F", "ON/OFF R",
+                "Vg step (V)",
             ]
             # 화면 표시용 표: gm / ON-OFF는 e 표기, 나머지는 필요한 소수점으로 정리
             batch_display_df = result_df[display_cols].copy()
@@ -1266,6 +1279,7 @@ with tab_batch:
                 "SS R (mV/dec)": 2,
                 "muFE F (cm2/Vs)": 3,
                 "muFE R (cm2/Vs)": 3,
+                "Vg step (V)": 3,
             }
             for col, decimals in batch_fixed_formats.items():
                 if col in batch_display_df.columns:
