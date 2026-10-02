@@ -552,9 +552,39 @@ def make_single_figures(results: dict, frames: dict, use_abs_id: bool):
     fig2 = Figure(figsize=(9, 5.2), dpi=110)
     ax2 = fig2.add_subplot(111)
     for label, data in frames.items():
+        r = results[label]
         y = np.abs(data["Id_raw"].to_numpy(dtype=float))
         y[y <= 0] = np.nan
-        ax2.semilogy(data["Vg"], y, label=f"{label} |Id|")
+
+        # Id curve 색상을 SS max-slope marker에도 그대로 사용
+        line_id, = ax2.semilogy(data["Vg"], y, label=f"{label} |Id|")
+
+        # Log 그래프에서는 gm_max가 아니라
+        # SS 계산에 사용된 가장 가파른 log10(Id)-Vg 구간의 중심점을 표시
+        ss_x = r.get("SS_Vg_center_V", np.nan)
+        if np.isfinite(ss_x):
+            vg_arr = data["Vg"].to_numpy(dtype=float)
+            finite_idx = np.where(
+                np.isfinite(vg_arr) & np.isfinite(y) & (y > 0)
+            )[0]
+
+            if len(finite_idx):
+                nearest_idx = finite_idx[
+                    np.argmin(np.abs(vg_arr[finite_idx] - ss_x))
+                ]
+                ss_y = float(y[nearest_idx])
+                ss_x_plot = float(vg_arr[nearest_idx])
+
+                ax2.scatter(
+                    [ss_x_plot], [ss_y],
+                    s=55,
+                    color=line_id.get_color(),
+                    edgecolors="black",
+                    linewidths=0.6,
+                    zorder=6,
+                    label="_nolegend_",
+                )
+
         if "Ig_raw" in data.columns:
             yig = np.abs(data["Ig_raw"].to_numpy(dtype=float))
             yig[yig <= 0] = np.nan
