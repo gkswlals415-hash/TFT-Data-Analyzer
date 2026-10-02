@@ -998,7 +998,33 @@ with tab_single:
             m4.metric("SS F", f"{f['SS_mV_dec']:.2f} mV/dec" if np.isfinite(f['SS_mV_dec']) else "N/A")
             m5.metric("μFE F", f"{f['mu_FE_cm2_Vs']:.3f} cm²/V·s" if np.isfinite(f['mu_FE_cm2_Vs']) else "N/A")
 
-        st.dataframe(single_results_dataframe(results), use_container_width=True, hide_index=True)
+        # 화면 표시용: 작은/큰 값은 과학적 표기법으로 보기 쉽게 표시
+        single_display_df = single_results_dataframe(results).copy()
+
+        single_sci_cols = [
+            "gm_max (S)",
+            "Id @ gm_max (A)",
+            "ON/OFF",
+            "Cox (F/cm²)",
+        ]
+        for col in single_sci_cols:
+            if col in single_display_df.columns:
+                single_display_df[col] = single_display_df[col].apply(fmt_sci)
+
+        single_fixed_formats = {
+            "Vth (V)": 4,
+            "SS (mV/dec)": 2,
+            "μFE (cm²/V·s)": 3,
+            "Vg @ gm_max (V)": 3,
+            "Vd used (V)": 3,
+        }
+        for col, decimals in single_fixed_formats.items():
+            if col in single_display_df.columns:
+                single_display_df[col] = single_display_df[col].apply(
+                    lambda x, d=decimals: fmt_num(x, d)
+                )
+
+        st.dataframe(single_display_df, use_container_width=True, hide_index=True)
 
         p1, p2, p3 = st.tabs(["Linear Id-Vg", "Log Id+Ig-Vg", "gm-Vg"])
         with p1:
@@ -1219,7 +1245,35 @@ with tab_batch:
                 "muFE F (cm2/Vs)", "muFE R (cm2/Vs)",
                 "ON/OFF F", "ON/OFF R",
             ]
-            st.dataframe(result_df[display_cols], use_container_width=True, hide_index=True)
+            # 화면 표시용 표: gm / ON-OFF는 e 표기, 나머지는 필요한 소수점으로 정리
+            batch_display_df = result_df[display_cols].copy()
+
+            batch_sci_cols = [
+                "gm_max F (S)",
+                "gm_max R (S)",
+                "ON/OFF F",
+                "ON/OFF R",
+            ]
+            for col in batch_sci_cols:
+                if col in batch_display_df.columns:
+                    batch_display_df[col] = batch_display_df[col].apply(fmt_sci)
+
+            batch_fixed_formats = {
+                "Vth F (V)": 4,
+                "Vth R (V)": 4,
+                "Vth Hysteresis R-F (V)": 4,
+                "SS F (mV/dec)": 2,
+                "SS R (mV/dec)": 2,
+                "muFE F (cm2/Vs)": 3,
+                "muFE R (cm2/Vs)": 3,
+            }
+            for col, decimals in batch_fixed_formats.items():
+                if col in batch_display_df.columns:
+                    batch_display_df[col] = batch_display_df[col].apply(
+                        lambda x, d=decimals: fmt_num(x, d)
+                    )
+
+            st.dataframe(batch_display_df, use_container_width=True, hide_index=True)
 
             bp1, bp2, bp3 = st.tabs(["Linear Id-Vg", "Log Id+Ig-Vg", "gm-Vg"])
             with bp1:
