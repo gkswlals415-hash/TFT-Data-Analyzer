@@ -33,6 +33,14 @@ def _excel_source(file_bytes: bytes):
     return io.BytesIO(file_bytes)
 
 
+
+def display_centered_figure(fig):
+    """Display a Matplotlib figure at about 80% of the page width."""
+    _, center_col, _ = st.columns([1, 8, 1])
+    with center_col:
+        st.pyplot(fig, use_container_width=True)
+
+
 def find_header_row(
     file_bytes: bytes,
     sheet_name: str,
@@ -994,11 +1002,11 @@ with tab_single:
 
         p1, p2, p3 = st.tabs(["Linear Id-Vg", "Log Id+Ig-Vg", "gm-Vg"])
         with p1:
-            st.pyplot(single_payload["figs"][0], use_container_width=True)
+            display_centered_figure(single_payload["figs"][0])
         with p2:
-            st.pyplot(single_payload["figs"][1], use_container_width=True)
+            display_centered_figure(single_payload["figs"][1])
         with p3:
-            st.pyplot(single_payload["figs"][2], use_container_width=True)
+            display_centered_figure(single_payload["figs"][2])
 
         stem = Path(single_payload["file_name"]).stem
         dl1, dl2 = st.columns(2)
@@ -1215,11 +1223,11 @@ with tab_batch:
 
             bp1, bp2, bp3 = st.tabs(["Linear Id-Vg", "Log Id+Ig-Vg", "gm-Vg"])
             with bp1:
-                st.pyplot(batch_payload["figs"][0], use_container_width=True)
+                display_centered_figure(batch_payload["figs"][0])
             with bp2:
-                st.pyplot(batch_payload["figs"][1], use_container_width=True)
+                display_centered_figure(batch_payload["figs"][1])
             with bp3:
-                st.pyplot(batch_payload["figs"][2], use_container_width=True)
+                display_centered_figure(batch_payload["figs"][2])
 
             bdl1, bdl2 = st.columns(2)
 
