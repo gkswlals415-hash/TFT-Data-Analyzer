@@ -466,6 +466,7 @@ def analyze_batch_file(
     file_name: str,
     sheet_name: str,
     *,
+    device_label: str | None = None,
     col_vg: str,
     col_id: str,
     col_ig: str,
@@ -512,7 +513,8 @@ def analyze_batch_file(
 
     path = Path(file_name)
     row = {
-        "Device": path.stem,
+        # 같은 파일명(d1.xls 등)이 여러 번 업로드되어도 서로 다른 소자로 유지
+        "Device": device_label if device_label else path.stem,
         "File": path.name,
         "Sheet": sheet_name,
         "Vth F (V)": f["Vth_V"],
@@ -1602,7 +1604,10 @@ with tab_batch:
         batch_vd = st.text_input("Vd 열", "AV", key="batch_vd")
 
     if batch_files:
-        st.caption("각 파일에서 BV/AI가 있는 가장 마지막 측정 Sheet를 자동 선택합니다.")
+        st.caption(
+            "각 파일에서 BV/AI가 있는 가장 마지막 측정 Sheet를 자동 선택합니다. "
+            "파일명이 같아도 서로 다른 업로드는 별도 소자로 분석하며, 예: d1 / d1_2 / d1_3으로 구분합니다."
+        )
 
     if st.button("Batch 분석 실행", type="primary", key="batch_run"):
         if not batch_files:
@@ -1616,9 +1621,21 @@ with tab_batch:
             progress = st.progress(0, text="Batch 분석 준비 중...")
             total = len(batch_files)
 
+            # 브라우저 업로드 객체는 서로 다른 폴더의 파일이라도 파일명이 같을 수 있습니다.
+            # 파일명을 내부 ID로 사용하면 d1.xls + d1.xls가 같은 데이터로 덮어써질 수 있으므로
+            # 업로드 순서에 따라 고유한 Device label을 만들어 사용합니다.
+            device_name_counts = {}
+
             for i, uploaded in enumerate(batch_files, start=1):
                 progress.progress((i - 1) / total, text=f"분석 중 {i}/{total}: {uploaded.name}")
                 file_bytes = uploaded.getvalue()
+
+                base_device = Path(uploaded.name).stem
+                device_name_counts[base_device] = device_name_counts.get(base_device, 0) + 1
+                occurrence = device_name_counts[base_device]
+                device_label = base_device if occurrence == 1 else f"{base_device}_{occurrence}"
+                unique_file_key = f"{i:03d}::{uploaded.name}"
+
                 try:
                     sheet = find_default_measurement_sheet(
                         file_bytes,
@@ -1629,6 +1646,7 @@ with tab_batch:
                         file_bytes,
                         uploaded.name,
                         sheet,
+                        device_label=device_label,
                         col_vg=batch_vg.strip(),
                         col_id=batch_id.strip(),
                         col_ig=batch_ig.strip(),
@@ -1644,8 +1662,8 @@ with tab_batch:
                         eps0=float(batch_eps0),
                     )
                     rows.append(row)
-                    detected_sheets.append({"File": uploaded.name, "Sheet": sheet, "Status": "Done"})
-                    curves[uploaded.name] = {
+                    detected_sheets.append({"Device": device_label, "File": uploaded.name, "Sheet": sheet, "Status": "Done"})
+                    curves[unique_file_key] = {
                         "Device": row["Device"],
                         "Forward": file_curves["Forward"],
                         "Reverse": file_curves["Reverse"],
@@ -1656,12 +1674,12 @@ with tab_batch:
                     }
                 except Exception as e:
                     errors.append({
-                        "Device": Path(uploaded.name).stem,
+                        "Device": device_label,
                         "File": uploaded.name,
                         "Sheet": "",
                         "Error": str(e),
                     })
-                    detected_sheets.append({"File": uploaded.name, "Sheet": "", "Status": f"ERROR: {e}"})
+                    detected_sheets.append({"Device": device_label, "File": uploaded.name, "Sheet": "", "Status": f"ERROR: {e}"})
 
                 progress.progress(i / total, text=f"분석 중 {i}/{total}: {uploaded.name}")
 
