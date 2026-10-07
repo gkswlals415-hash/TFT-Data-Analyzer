@@ -1182,10 +1182,82 @@ def format_statistics_for_display(stats_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+OUTLIER_METRICS = {
+    "Vth F (gm-max)": "Vth F (V)",
+    "Vth R (gm-max)": "Vth R (V)",
+    "Vth Hysteresis (gm-max)": "Vth Hysteresis R-F (V)",
+    "Vth CC F": "Vth CC F (V)",
+    "Vth CC R": "Vth CC R (V)",
+    "Vth CC Hysteresis": "Vth CC Hysteresis R-F (V)",
+    "gm_max F": "gm_max F (S)",
+    "gm_max R": "gm_max R (S)",
+    "SS F": "SS F (mV/dec)",
+    "SS R": "SS R (mV/dec)",
+    "μFE F": "muFE F (cm2/Vs)",
+    "μFE R": "muFE R (cm2/Vs)",
+    "ON/OFF F": "ON/OFF F",
+    "ON/OFF R": "ON/OFF R",
+}
+
+
+def detect_iqr_outliers(
+    df: pd.DataFrame,
+    columns: list[str],
+    multiplier: float = 1.5,
+) -> tuple[set[str], pd.DataFrame]:
+    """선택한 특성값에서 IQR 기준 이상치를 찾습니다.
+
+    한 소자가 선택한 특성 중 하나라도 이상치이면 해당 소자를 제외 대상으로 표시합니다.
+    원본 데이터 자체는 삭제하지 않습니다.
+    """
+    flagged: set[str] = set()
+    details: list[dict] = []
+
+    for col in columns:
+        if col not in df.columns:
+            continue
+
+        values = pd.to_numeric(df[col], errors="coerce")
+        finite = values[np.isfinite(values)]
+
+        # 너무 적은 표본에서는 IQR 판정이 의미가 약하므로 자동 제거하지 않음
+        if len(finite) < 4:
+            continue
+
+        q1 = float(finite.quantile(0.25))
+        q3 = float(finite.quantile(0.75))
+        iqr = q3 - q1
+
+        if not np.isfinite(iqr) or iqr <= 0:
+            continue
+
+        lower = q1 - float(multiplier) * iqr
+        upper = q3 + float(multiplier) * iqr
+
+        for idx, value in values.items():
+            if not np.isfinite(value):
+                continue
+            if value < lower or value > upper:
+                device = str(df.loc[idx, "Device"])
+                flagged.add(device)
+                details.append({
+                    "Device": device,
+                    "Metric": col,
+                    "Value": float(value),
+                    "Lower bound": lower,
+                    "Upper bound": upper,
+                    "Reason": f"IQR {multiplier:.1f}× 기준 밖",
+                })
+
+    return flagged, pd.DataFrame(details)
+
+
 def build_batch_excel(
     result_df: pd.DataFrame,
     errors_df: pd.DataFrame,
     *,
+    all_result_df: pd.DataFrame | None = None,
+    outlier_df: pd.DataFrame | None = None,
     W_um: float,
     L_um: float,
     eps_r: float,
@@ -1200,6 +1272,11 @@ def build_batch_excel(
     col_vd: str,
 ) -> bytes:
     output = io.BytesIO()
+
+    if all_result_df is None:
+        all_result_df = result_df.copy()
+    if outlier_df is None:
+        outlier_df = pd.DataFrame()
 
     average_row = {"Device": "AVERAGE", "File": "", "Sheet": f"N={len(result_df)}"}
     for col in result_df.columns:
@@ -1231,8 +1308,16 @@ def build_batch_excel(
     ])
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # Summary/Statistics는 이상치 제외가 적용된 데이터 기준
         summary_df.to_excel(writer, sheet_name="Summary", index=False)
         stats_df.to_excel(writer, sheet_name="Statistics", index=False)
+
+        # 원본 Batch 계산 결과는 항상 별도 보존
+        all_result_df.to_excel(writer, sheet_name="All_Results", index=False)
+
+        if not outlier_df.empty:
+            outlier_df.to_excel(writer, sheet_name="Outliers", index=False)
+
         params_df.to_excel(writer, sheet_name="Parameters", index=False)
         if not errors_df.empty:
             errors_df.to_excel(writer, sheet_name="Errors", index=False)
@@ -1651,6 +1736,110 @@ with tab_batch:
                 st.dataframe(batch_payload["detected"], use_container_width=True, hide_index=True)
 
         if success:
+            # ----------------------------------------------------
+            # Outlier filtering (원본 결과는 삭제하지 않음)
+            # ----------------------------------------------------
+            with st.expander("이상치 제외 설정", expanded=False):
+                st.caption(
+                    "이 기능은 원본 측정값을 삭제하지 않고, 평균/통계/분산 그래프/Batch overlay에서만 "
+                    "선택한 소자를 제외합니다. Excel에는 전체 결과(All_Results)와 제외 내역(Outliers)을 함께 저장합니다."
+                )
+
+                outlier_mode = st.radio(
+                    "이상치 처리 방법",
+                    ["사용 안 함", "IQR 자동", "직접 선택"],
+                    horizontal=True,
+                    key="batch_outlier_mode",
+                )
+
+                excluded_devices: set[str] = set()
+                outlier_details = pd.DataFrame()
+
+                if outlier_mode == "IQR 자동":
+                    selected_outlier_labels = st.multiselect(
+                        "이상치 판정에 사용할 특성값",
+                        options=list(OUTLIER_METRICS.keys()),
+                        default=["Vth F (gm-max)", "Vth R (gm-max)"],
+                        key="batch_outlier_metrics",
+                    )
+                    iqr_multiplier = st.number_input(
+                        "IQR 배수",
+                        min_value=0.5,
+                        max_value=5.0,
+                        value=1.5,
+                        step=0.1,
+                        key="batch_iqr_multiplier",
+                    )
+                    selected_columns = [
+                        OUTLIER_METRICS[label]
+                        for label in selected_outlier_labels
+                    ]
+                    excluded_devices, outlier_details = detect_iqr_outliers(
+                        result_df, selected_columns, float(iqr_multiplier)
+                    )
+                    st.caption(
+                        "IQR 자동은 Q1−k×IQR ~ Q3+k×IQR 범위를 벗어난 소자를 표시합니다. "
+                        "기본 k=1.5이며, 선택한 특성 중 하나라도 기준을 벗어나면 해당 소자를 제외합니다."
+                    )
+
+                elif outlier_mode == "직접 선택":
+                    manual_devices = st.multiselect(
+                        "평균/통계/그래프에서 제외할 소자",
+                        options=result_df["Device"].astype(str).tolist(),
+                        key="batch_manual_outliers",
+                    )
+                    excluded_devices = set(manual_devices)
+                    if excluded_devices:
+                        outlier_details = pd.DataFrame([
+                            {
+                                "Device": dev,
+                                "Metric": "Manual",
+                                "Value": np.nan,
+                                "Lower bound": np.nan,
+                                "Upper bound": np.nan,
+                                "Reason": "사용자 직접 제외",
+                            }
+                            for dev in sorted(excluded_devices)
+                        ])
+
+                if excluded_devices:
+                    st.warning(
+                        f"제외 대상 {len(excluded_devices)}개: "
+                        + ", ".join(sorted(excluded_devices))
+                    )
+                    if not outlier_details.empty:
+                        st.dataframe(
+                            outlier_details,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                else:
+                    st.info("현재 제외되는 소자가 없습니다.")
+
+            active_df = result_df[
+                ~result_df["Device"].astype(str).isin(excluded_devices)
+            ].copy()
+
+            if active_df.empty:
+                st.error("모든 소자가 제외되어 분석할 데이터가 없습니다. 이상치 설정을 변경하세요.")
+                active_df = result_df.copy()
+                excluded_devices = set()
+                outlier_details = pd.DataFrame()
+
+            st.caption(
+                f"Batch 통계 사용 소자: 전체 {len(result_df)}개 / 사용 {len(active_df)}개 / 제외 {len(excluded_devices)}개"
+            )
+
+            # 이상치 제외 상태를 원본 결과표에서도 확인할 수 있게 표시
+            result_df_with_status = result_df.copy()
+            result_df_with_status.insert(
+                1,
+                "사용 여부",
+                result_df_with_status["Device"].astype(str).apply(
+                    lambda d: "제외" if d in excluded_devices else "사용"
+                ),
+            )
+
             numeric_cols = [
                 "Vth F (V)", "Vth R (V)", "Vth Hysteresis R-F (V)",
                 "Vth CC F (V)", "Vth CC R (V)", "Vth CC Hysteresis R-F (V)",
@@ -1660,10 +1849,13 @@ with tab_batch:
                 "ON/OFF F", "ON/OFF R",
                 "Vg step (V)",
             ]
-            avg = result_df[numeric_cols].apply(pd.to_numeric, errors="coerce").mean()
+            avg = active_df[numeric_cols].apply(pd.to_numeric, errors="coerce").mean()
 
             # Batch 평균값을 한눈에 보기 쉬운 표로 표시
-            st.markdown("#### Batch 평균값")
+            if excluded_devices:
+                st.markdown("#### Batch 평균값 (이상치 제외 후)")
+            else:
+                st.markdown("#### Batch 평균값")
 
             avg_table = pd.DataFrame([
                 {
@@ -1710,7 +1902,7 @@ with tab_batch:
             )
 
             display_cols = [
-                "Device", "Sheet",
+                "Device", "사용 여부", "Sheet",
                 "Vth F (V)", "Vth R (V)", "Vth Hysteresis R-F (V)",
                 "Vth CC F (V)", "Vth CC R (V)", "Vth CC Hysteresis R-F (V)",
                 "gm_max F (S)", "gm_max R (S)",
@@ -1720,7 +1912,7 @@ with tab_batch:
                 "Vg step (V)",
             ]
             # 화면 표시용 표: gm / ON-OFF는 e 표기, 나머지는 필요한 소수점으로 정리
-            batch_display_df = result_df[display_cols].copy()
+            batch_display_df = result_df_with_status[display_cols].copy()
 
             batch_sci_cols = [
                 "gm_max F (S)",
@@ -1762,7 +1954,7 @@ with tab_batch:
                     "같은 조건의 소자 균일성을 비교할 때는 보통 Std와 CV가 작을수록 균일합니다."
                 )
 
-                stats_df = statistics_dataframe(result_df)
+                stats_df = statistics_dataframe(active_df)
                 stats_display_df = format_statistics_for_display(stats_df)
                 st.dataframe(
                     stats_display_df,
@@ -1777,7 +1969,7 @@ with tab_batch:
                 )
 
                 variation_fig = make_variability_figure(
-                    result_df, selected_variation_metric
+                    active_df, selected_variation_metric
                 )
                 display_centered_figure(variation_fig)
                 st.caption(
@@ -1801,6 +1993,14 @@ with tab_batch:
 
             st.caption("Batch gm 그래프는 Forward와 Reverse를 분리해서 표시하며, 각 그래프의 마커가 gm_max 위치입니다.")
 
+            active_device_names = set(active_df["Device"].astype(str))
+            active_curves = {
+                key: item
+                for key, item in batch_payload["curves"].items()
+                if str(item.get("Device", "")) in active_device_names
+            }
+            active_figs = make_batch_figures(active_curves)
+
             bp1, bp2, bp3, bp4 = st.tabs([
                 "Linear Id-Vg",
                 "Log Id+Ig-Vg",
@@ -1808,20 +2008,50 @@ with tab_batch:
                 "gm-Vg Reverse",
             ])
             with bp1:
-                display_centered_figure(batch_payload["figs"][0])
+                display_centered_figure(active_figs[0])
             with bp2:
-                display_centered_figure(batch_payload["figs"][1])
+                display_centered_figure(active_figs[1])
             with bp3:
-                display_centered_figure(batch_payload["figs"][2])
+                display_centered_figure(active_figs[2])
             with bp4:
-                display_centered_figure(batch_payload["figs"][3])
+                display_centered_figure(active_figs[3])
+
+            active_excel_bytes = build_batch_excel(
+                active_df,
+                errors_df,
+                all_result_df=result_df,
+                outlier_df=outlier_details,
+                W_um=float(batch_w),
+                L_um=float(batch_l),
+                eps_r=float(batch_epsr),
+                tox_nm=float(batch_tox),
+                eps0=float(batch_eps0),
+                smoothing=int(batch_smooth),
+                ss_window=int(batch_ss),
+                constant_current_A=float(batch_iref),
+                col_vg=batch_vg.strip(),
+                col_id=batch_id.strip(),
+                col_ig=batch_ig.strip(),
+                col_vd=batch_vd.strip(),
+            )
+
+            active_graph_zip = build_figures_zip(
+                active_figs,
+                [
+                    "TFT_Batch_Linear_Id_Overlay.png",
+                    "TFT_Batch_Log_Id_Ig_Overlay.png",
+                    "TFT_Batch_gm_Forward.png",
+                    "TFT_Batch_gm_Reverse.png",
+                ],
+                dpi=300,
+            )
 
             bdl1, bdl2 = st.columns(2)
 
             with bdl1:
                 st.download_button(
                     "Batch 결과 Excel 다운로드",
-                    data=batch_payload["excel"],
+                    data=active_excel_bytes,
                     file_name="TFT_Batch_Analysis.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="batch_download",
@@ -1831,7 +2061,7 @@ with tab_batch:
             with bdl2:
                 st.download_button(
                     "Batch 그래프 이미지 다운로드",
-                    data=batch_payload["graph_zip"],
+                    data=active_graph_zip,
                     file_name="TFT_Batch_Graphs.zip",
                     mime="application/zip",
                     key="batch_graph_download",
