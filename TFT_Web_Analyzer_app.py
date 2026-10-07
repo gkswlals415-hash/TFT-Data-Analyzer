@@ -178,6 +178,7 @@ def analyze_sweep(
     seg: pd.DataFrame,
     smoothing_window: int = 5,
     ss_window: int = 7,
+    constant_current_A: float = 1e-6,
 ) -> tuple[dict, pd.DataFrame]:
     data = seg.copy()
 
@@ -265,6 +266,48 @@ def analyze_sweep(
     ss_v_dec = best_ss
     ss_mv_dec = best_ss * 1000 if np.isfinite(best_ss) else np.nan
 
+    # Constant-current Vth
+    # |Id| = Iref가 되는 Vg를 log10(|Id|)-Vg 공간에서 선형 보간합니다.
+    # 노이즈로 교차점이 여러 개면 SS maximum-slope 중심에 가장 가까운 교차점을 선택합니다.
+    iref = float(constant_current_A)
+    if not np.isfinite(iref) or iref <= 0:
+        raise ValueError("Constant current Iref는 0보다 커야 합니다.")
+
+    id_cc = np.abs(data["Id_analysis"].to_numpy(dtype=float))
+    valid_cc = np.isfinite(vg) & np.isfinite(id_cc) & (id_cc > 0)
+    vg_cc = vg[valid_cc]
+    id_cc = id_cc[valid_cc]
+    cc_candidates = []
+
+    if len(vg_cc) >= 2:
+        log_cc = np.log10(id_cc)
+        target = np.log10(iref)
+        for i in range(len(vg_cc) - 1):
+            x1, x2 = float(vg_cc[i]), float(vg_cc[i + 1])
+            y1, y2 = float(log_cc[i]), float(log_cc[i + 1])
+            d1, d2 = y1 - target, y2 - target
+
+            if d1 == 0:
+                cc_candidates.append(x1)
+            if d2 == 0:
+                cc_candidates.append(x2)
+
+            if d1 * d2 < 0:
+                if y2 != y1:
+                    x_cross = x1 + (target - y1) * (x2 - x1) / (y2 - y1)
+                else:
+                    x_cross = (x1 + x2) / 2.0
+                cc_candidates.append(float(x_cross))
+
+    if cc_candidates:
+        cc_candidates = np.asarray(cc_candidates, dtype=float)
+        if np.isfinite(best_vg_center):
+            vth_cc = float(cc_candidates[np.argmin(np.abs(cc_candidates - best_vg_center))])
+        else:
+            vth_cc = float(cc_candidates[0])
+    else:
+        vth_cc = np.nan
+
     # ON/OFF
     id_positive = np.abs(data["Id_analysis"].to_numpy(dtype=float))
     finite_positive = id_positive[
@@ -285,6 +328,8 @@ def analyze_sweep(
         "SS_V_dec": ss_v_dec,
         "SS_mV_dec": ss_mv_dec,
         "SS_Vg_center_V": best_vg_center,
+        "Vth_CC_V": vth_cc,
+        "Constant_Current_A": iref,
         "Ion_A": ion,
         "Ioff_A": ioff,
         "On_Off": onoff,
@@ -340,6 +385,7 @@ def analyze_single_file(
     col_vd: str,
     smoothing_window: int,
     ss_window: int,
+    constant_current_A: float,
     use_abs_id: bool,
     W_um: float,
     L_um: float,
@@ -377,6 +423,7 @@ def analyze_single_file(
             seg,
             smoothing_window=smoothing_window,
             ss_window=ss_window,
+            constant_current_A=constant_current_A,
         )
         result = add_mobility(
             result,
@@ -425,6 +472,7 @@ def analyze_batch_file(
     col_vd: str,
     smoothing_window: int,
     ss_window: int,
+    constant_current_A: float,
     use_abs_id: bool,
     W_um: float,
     L_um: float,
@@ -441,6 +489,7 @@ def analyze_batch_file(
         col_vd=col_vd,
         smoothing_window=smoothing_window,
         ss_window=ss_window,
+        constant_current_A=constant_current_A,
         use_abs_id=use_abs_id,
         W_um=W_um,
         L_um=L_um,
@@ -455,6 +504,11 @@ def analyze_batch_file(
     f = results["Forward"]
     r = results["Reverse"]
     hysteresis = r["Vth_V"] - f["Vth_V"]
+    hysteresis_cc = (
+        r["Vth_CC_V"] - f["Vth_CC_V"]
+        if np.isfinite(r["Vth_CC_V"]) and np.isfinite(f["Vth_CC_V"])
+        else np.nan
+    )
 
     path = Path(file_name)
     row = {
@@ -464,6 +518,10 @@ def analyze_batch_file(
         "Vth F (V)": f["Vth_V"],
         "Vth R (V)": r["Vth_V"],
         "Vth Hysteresis R-F (V)": hysteresis,
+        "Vth CC F (V)": f["Vth_CC_V"],
+        "Vth CC R (V)": r["Vth_CC_V"],
+        "Vth CC Hysteresis R-F (V)": hysteresis_cc,
+        "Constant Current Iref (A)": f["Constant_Current_A"],
         "gm_max F (S)": f["gm_max_S"],
         "gm_max R (S)": r["gm_max_S"],
         "SS F (mV/dec)": f["SS_mV_dec"],
@@ -512,7 +570,9 @@ def single_results_dataframe(results: dict) -> pd.DataFrame:
     for label, r in results.items():
         rows.append({
             "Sweep": label,
-            "Vth (V)": r["Vth_V"],
+            "Vth gm-max (V)": r["Vth_V"],
+            "Vth constant-current (V)": r["Vth_CC_V"],
+            "Iref (A)": r["Constant_Current_A"],
             "gm_max (S)": r["gm_max_S"],
             "SS (mV/dec)": r["SS_mV_dec"],
             "μFE (cm²/V·s)": r["mu_FE_cm2_Vs"],
@@ -551,6 +611,22 @@ def make_single_figures(results: dict, frames: dict, use_abs_id: bool):
     # Log Id + Ig
     fig2 = Figure(figsize=(9, 5.2), dpi=110)
     ax2 = fig2.add_subplot(111)
+
+    # Constant-current 기준선
+    iref_plot = np.nan
+    if results:
+        first_result = next(iter(results.values()))
+        iref_plot = first_result.get("Constant_Current_A", np.nan)
+    if np.isfinite(iref_plot) and iref_plot > 0:
+        ax2.axhline(
+            iref_plot,
+            color="gray",
+            linestyle=":",
+            linewidth=1.2,
+            alpha=0.8,
+            label=f"Constant current Iref={iref_plot:.1e} A",
+        )
+
     for label, data in frames.items():
         r = results[label]
         y = np.abs(data["Id_raw"].to_numpy(dtype=float))
@@ -584,6 +660,20 @@ def make_single_figures(results: dict, frames: dict, use_abs_id: bool):
                     zorder=6,
                     label="_nolegend_",
                 )
+
+        # Constant-current Vth 교차점: X marker
+        cc_x = r.get("Vth_CC_V", np.nan)
+        cc_i = r.get("Constant_Current_A", np.nan)
+        if np.isfinite(cc_x) and np.isfinite(cc_i) and cc_i > 0:
+            ax2.scatter(
+                [cc_x], [cc_i],
+                s=65,
+                marker="x",
+                color=line_id.get_color(),
+                linewidths=1.8,
+                zorder=7,
+                label="_nolegend_",
+            )
 
         if "Ig_raw" in data.columns:
             yig = np.abs(data["Ig_raw"].to_numpy(dtype=float))
@@ -694,20 +784,83 @@ def make_batch_figures(curves: dict):
     # gm
     fig3 = Figure(figsize=(12, 6), dpi=100)
     ax3 = fig3.add_subplot(111)
+    gm_device_handles = []
+
     for item in curves.values():
         device = item["Device"]
         f = item["Forward"]
         r = item["Reverse"]
-        line_f, = ax3.plot(f["Vg"], f["gm"], label=device, linewidth=1.5)
+
+        # 같은 소자는 같은 색상, Forward=실선 / Reverse=점선
+        line_f, = ax3.plot(f["Vg"], f["gm"], linewidth=1.5)
+        device_color = line_f.get_color()
         ax3.plot(
             r["Vg"], r["gm"], linestyle="--", linewidth=1.2,
-            color=line_f.get_color(), label="_nolegend_"
+            color=device_color, label="_nolegend_"
         )
+
+        # 각 sweep의 gm_max 위치를 직접 표시
+        x_f = item.get("Vg_gmmax_F", np.nan)
+        y_f = item.get("gmmax_F", np.nan)
+        if np.isfinite(x_f) and np.isfinite(y_f):
+            ax3.scatter(
+                [x_f], [y_f],
+                s=48, marker="o",
+                color=device_color,
+                edgecolors="black", linewidths=0.55,
+                zorder=6, label="_nolegend_",
+            )
+
+        x_r = item.get("Vg_gmmax_R", np.nan)
+        y_r = item.get("gmmax_R", np.nan)
+        if np.isfinite(x_r) and np.isfinite(y_r):
+            ax3.scatter(
+                [x_r], [y_r],
+                s=52, marker="s",
+                color=device_color,
+                edgecolors="black", linewidths=0.55,
+                zorder=6, label="_nolegend_",
+            )
+
+        gm_device_handles.append(
+            Line2D([0], [0], color=device_color, linewidth=1.8, label=device)
+        )
+
     ax3.set_xlabel("Gate Voltage, Vg (V)")
     ax3.set_ylabel("Transconductance, gm (S)")
-    ax3.set_title("All Devices - gm-Vg (solid F / dashed R)")
+    ax3.set_title("All Devices - gm-Vg with gm_max points")
     ax3.grid(True, alpha=0.25)
-    ax3.legend(title="Device", fontsize=8, ncol=max(1, min(5, len(curves))))
+
+    # Device 색상 legend
+    if gm_device_handles:
+        gm_device_legend = ax3.legend(
+            handles=gm_device_handles,
+            title="Device",
+            fontsize=8,
+            ncol=max(1, min(5, len(gm_device_handles))),
+            loc="upper left",
+        )
+        ax3.add_artist(gm_device_legend)
+
+    # Forward / Reverse + gm_max marker legend
+    gm_style_handles = [
+        Line2D(
+            [0], [0], color="black", linestyle="-", linewidth=1.5,
+            marker="o", markersize=6, markeredgecolor="black",
+            label="Forward / gm_max",
+        ),
+        Line2D(
+            [0], [0], color="black", linestyle="--", linewidth=1.2,
+            marker="s", markersize=6, markeredgecolor="black",
+            label="Reverse / gm_max",
+        ),
+    ]
+    ax3.legend(
+        handles=gm_style_handles,
+        title="Sweep / gm_max",
+        fontsize=8,
+        loc="lower right",
+    )
     fig3.tight_layout()
 
     return fig1, fig2, fig3
@@ -763,7 +916,9 @@ def build_single_excel(
             "File": file_name,
             "Sheet": sheet_name,
             "Sweep": label,
-            "Vth (V)": r["Vth_V"],
+            "Vth gm-max (V)": r["Vth_V"],
+            "Vth constant-current (V)": r["Vth_CC_V"],
+            "Constant current Iref (A)": r["Constant_Current_A"],
             "Mobility μFE (cm2/Vs)": r["mu_FE_cm2_Vs"],
             "Cox (F/cm2)": r["Cox_F_cm2"],
             "Vg step (V)": r["Vg_Step_V"],
@@ -793,9 +948,13 @@ def build_single_excel(
         for label, data in frames.items():
             export_df = data.copy()
             r = results[label]
-            export_df["Vth_result_V"] = np.nan
+            export_df["Vth_gmmax_result_V"] = np.nan
+            export_df["Vth_constant_current_result_V"] = np.nan
+            export_df["Constant_current_Iref_A"] = np.nan
             export_df["gm_max_result_S"] = np.nan
-            export_df.loc[0, "Vth_result_V"] = r["Vth_V"]
+            export_df.loc[0, "Vth_gmmax_result_V"] = r["Vth_V"]
+            export_df.loc[0, "Vth_constant_current_result_V"] = r["Vth_CC_V"]
+            export_df.loc[0, "Constant_current_Iref_A"] = r["Constant_Current_A"]
             export_df.loc[0, "gm_max_result_S"] = r["gm_max_S"]
             export_df.to_excel(writer, sheet_name=f"{label}_Calc"[:31], index=False)
 
@@ -803,10 +962,14 @@ def build_single_excel(
 
 
 def statistics_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Batch 특성값의 평균/표준편차/분산/CV/범위를 계산합니다."""
     metrics = [
         "Vth F (V)",
         "Vth R (V)",
         "Vth Hysteresis R-F (V)",
+        "Vth CC F (V)",
+        "Vth CC R (V)",
+        "Vth CC Hysteresis R-F (V)",
         "gm_max F (S)",
         "gm_max R (S)",
         "SS F (mV/dec)",
@@ -819,17 +982,172 @@ def statistics_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     ]
     rows = []
     for metric in metrics:
-        s = pd.to_numeric(df[metric], errors="coerce")
-        s = s[np.isfinite(s)]
+        if metric not in df.columns:
+            continue
+
+        values = pd.to_numeric(df[metric], errors="coerce")
+        values = values[np.isfinite(values)]
+
+        if len(values):
+            mean = float(values.mean())
+            minimum = float(values.min())
+            maximum = float(values.max())
+        else:
+            mean = minimum = maximum = np.nan
+
+        std = float(values.std(ddof=1)) if len(values) > 1 else np.nan
+        variance = float(values.var(ddof=1)) if len(values) > 1 else np.nan
+        cv = (std / abs(mean) * 100.0) if (np.isfinite(std) and np.isfinite(mean) and abs(mean) > 1e-30) else np.nan
+        value_range = maximum - minimum if np.isfinite(maximum) and np.isfinite(minimum) else np.nan
+
         rows.append({
             "Metric": metric,
-            "N": int(s.count()),
-            "Mean": float(s.mean()) if len(s) else np.nan,
-            "Std": float(s.std(ddof=1)) if len(s) > 1 else np.nan,
-            "Min": float(s.min()) if len(s) else np.nan,
-            "Max": float(s.max()) if len(s) else np.nan,
+            "N": int(values.count()),
+            "Mean": mean,
+            "Std": std,
+            "Variance": variance,
+            "CV (%)": cv,
+            "Min": minimum,
+            "Max": maximum,
+            "Range": value_range,
         })
     return pd.DataFrame(rows)
+
+
+VARIABILITY_METRICS = {
+    "Vth (gm-max)": {
+        "columns": ["Vth F (V)", "Vth R (V)"],
+        "labels": ["Forward", "Reverse"],
+        "ylabel": "Vth (V)",
+        "log": False,
+    },
+    "Vth (constant-current)": {
+        "columns": ["Vth CC F (V)", "Vth CC R (V)"],
+        "labels": ["Forward", "Reverse"],
+        "ylabel": "Vth CC (V)",
+        "log": False,
+    },
+    "SS": {
+        "columns": ["SS F (mV/dec)", "SS R (mV/dec)"],
+        "labels": ["Forward", "Reverse"],
+        "ylabel": "SS (mV/dec)",
+        "log": False,
+    },
+    "Mobility μFE": {
+        "columns": ["muFE F (cm2/Vs)", "muFE R (cm2/Vs)"],
+        "labels": ["Forward", "Reverse"],
+        "ylabel": "μFE (cm²/V·s)",
+        "log": False,
+    },
+    "gm_max": {
+        "columns": ["gm_max F (S)", "gm_max R (S)"],
+        "labels": ["Forward", "Reverse"],
+        "ylabel": "gm_max (S)",
+        "log": False,
+    },
+    "ON/OFF ratio": {
+        "columns": ["ON/OFF F", "ON/OFF R"],
+        "labels": ["Forward", "Reverse"],
+        "ylabel": "ON/OFF ratio",
+        "log": True,
+    },
+    "Vth Hysteresis (gm-max)": {
+        "columns": ["Vth Hysteresis R-F (V)"],
+        "labels": ["Hysteresis"],
+        "ylabel": "Vth Hysteresis (V)",
+        "log": False,
+    },
+    "Vth Hysteresis (constant-current)": {
+        "columns": ["Vth CC Hysteresis R-F (V)"],
+        "labels": ["Hysteresis"],
+        "ylabel": "Vth CC Hysteresis (V)",
+        "log": False,
+    },
+}
+
+
+def make_variability_figure(df: pd.DataFrame, metric_name: str) -> Figure:
+    """소자별 특성값과 평균 ± 1σ 범위를 함께 표시합니다."""
+    info = VARIABILITY_METRICS[metric_name]
+    columns = info["columns"]
+    labels = info["labels"]
+
+    fig = Figure(figsize=(10, 5.2), dpi=110)
+    ax = fig.add_subplot(111)
+
+    x = np.arange(len(df), dtype=float)
+    device_names = df["Device"].astype(str).tolist()
+
+    for col, label in zip(columns, labels):
+        y = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+        line, = ax.plot(
+            x, y,
+            marker="o", markersize=5, linewidth=1.2,
+            label=label,
+        )
+
+        finite = y[np.isfinite(y)]
+        if len(finite):
+            mean = float(np.mean(finite))
+            std = float(np.std(finite, ddof=1)) if len(finite) > 1 else np.nan
+            ax.axhline(
+                mean,
+                color=line.get_color(),
+                linestyle=":", linewidth=1.25, alpha=0.9,
+            )
+
+            # 평균 ± 1σ 구간을 옅은 band로 표시
+            if np.isfinite(std):
+                low = mean - std
+                high = mean + std
+                if (not info["log"]) or low > 0:
+                    ax.fill_between(
+                        [-0.4, max(len(df) - 0.6, 0.6)],
+                        [low, low], [high, high],
+                        color=line.get_color(), alpha=0.08,
+                    )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(device_names, rotation=45, ha="right")
+    ax.set_xlabel("Device")
+    ax.set_ylabel(info["ylabel"])
+    ax.set_title(f"Device-to-device variation - {metric_name}")
+    ax.grid(True, alpha=0.25)
+    if info["log"]:
+        ax.set_yscale("log")
+    else:
+        ax.ticklabel_format(axis="y", style="sci", scilimits=(-3, 4))
+    ax.legend(title="Sweep")
+    fig.tight_layout()
+    return fig
+
+
+def format_statistics_for_display(stats_df: pd.DataFrame) -> pd.DataFrame:
+    """통계표를 읽기 쉬운 표기법으로 바꾼 화면 표시용 DataFrame."""
+    out = stats_df.copy()
+    numeric_cols = ["Mean", "Std", "Variance", "Min", "Max", "Range"]
+
+    def _auto_fmt(v):
+        try:
+            if not np.isfinite(v):
+                return "N/A"
+            av = abs(float(v))
+            if av != 0 and (av < 1e-3 or av >= 1e5):
+                return f"{v:.6e}"
+            return f"{v:.6g}"
+        except Exception:
+            return "N/A"
+
+    for col in numeric_cols:
+        if col in out.columns:
+            out[col] = out[col].apply(_auto_fmt)
+
+    if "CV (%)" in out.columns:
+        out["CV (%)"] = out["CV (%)"].apply(
+            lambda v: f"{v:.2f}" if pd.notna(v) and np.isfinite(v) else "N/A"
+        )
+
+    return out
 
 
 def build_batch_excel(
@@ -843,6 +1161,7 @@ def build_batch_excel(
     eps0: float,
     smoothing: int,
     ss_window: int,
+    constant_current_A: float,
     col_vg: str,
     col_id: str,
     col_ig: str,
@@ -872,6 +1191,7 @@ def build_batch_excel(
         {"Parameter": "Cox", "Value": Cox, "Unit": "F/cm2"},
         {"Parameter": "Smoothing window", "Value": smoothing, "Unit": "points"},
         {"Parameter": "SS window", "Value": ss_window, "Unit": "points"},
+        {"Parameter": "Constant current Iref", "Value": constant_current_A, "Unit": "A"},
         {"Parameter": "Vg column", "Value": col_vg, "Unit": ""},
         {"Parameter": "Id column", "Value": col_id, "Unit": ""},
         {"Parameter": "Ig column", "Value": col_ig, "Unit": ""},
@@ -940,6 +1260,13 @@ with tab_single:
         single_sheet = st.selectbox("Sheet", sheets, index=0 if sheets else None, placeholder="파일을 먼저 업로드하세요")
         single_ss = st.number_input("SS window", min_value=3, max_value=31, value=7, step=2, key="single_ss")
         single_smooth = st.number_input("Smoothing window", min_value=1, max_value=31, value=5, step=2, key="single_smooth")
+        single_iref = st.number_input(
+            "Constant current Iref (A)",
+            min_value=1e-15,
+            value=1e-7,
+            format="%.1e",
+            key="single_iref",
+        )
     with c2:
         single_w = st.number_input("W (µm)", value=100.0, key="single_w")
         single_l = st.number_input("L (µm)", value=10.0, key="single_l")
@@ -971,6 +1298,7 @@ with tab_single:
                         col_vd=single_vd.strip(),
                         smoothing_window=int(single_smooth),
                         ss_window=int(single_ss),
+                        constant_current_A=float(single_iref),
                         use_abs_id=single_abs,
                         W_um=float(single_w),
                         L_um=float(single_l),
@@ -1032,16 +1360,36 @@ with tab_single:
             r = results["Reverse"]
 
             m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Vth F", f"{f['Vth_V']:.4f} V")
-            m2.metric("Vth R", f"{r['Vth_V']:.4f} V")
-            m3.metric("Hysteresis R-F", f"{hys:.4f} V")
+            m1.metric("Vth gm-max F", f"{f['Vth_V']:.4f} V")
+            m2.metric("Vth gm-max R", f"{r['Vth_V']:.4f} V")
+            m3.metric("gm-max Hysteresis R-F", f"{hys:.4f} V")
             m4.metric("SS F", f"{f['SS_mV_dec']:.2f} mV/dec" if np.isfinite(f['SS_mV_dec']) else "N/A")
             m5.metric("μFE F", f"{f['mu_FE_cm2_Vs']:.3f} cm²/V·s" if np.isfinite(f['mu_FE_cm2_Vs']) else "N/A")
+
+            hys_cc = (
+                r["Vth_CC_V"] - f["Vth_CC_V"]
+                if np.isfinite(r["Vth_CC_V"]) and np.isfinite(f["Vth_CC_V"])
+                else np.nan
+            )
+            cc1, cc2, cc3 = st.columns(3)
+            cc1.metric(
+                "Vth constant-current F",
+                f"{f['Vth_CC_V']:.4f} V" if np.isfinite(f['Vth_CC_V']) else "N/A",
+            )
+            cc2.metric(
+                "Vth constant-current R",
+                f"{r['Vth_CC_V']:.4f} V" if np.isfinite(r['Vth_CC_V']) else "N/A",
+            )
+            cc3.metric(
+                "CC Hysteresis R-F",
+                f"{hys_cc:.4f} V" if np.isfinite(hys_cc) else "N/A",
+            )
 
         # 화면 표시용: 작은/큰 값은 과학적 표기법으로 보기 쉽게 표시
         single_display_df = single_results_dataframe(results).copy()
 
         single_sci_cols = [
+            "Iref (A)",
             "gm_max (S)",
             "Id @ gm_max (A)",
             "ON/OFF",
@@ -1052,7 +1400,8 @@ with tab_single:
                 single_display_df[col] = single_display_df[col].apply(fmt_sci)
 
         single_fixed_formats = {
-            "Vth (V)": 4,
+            "Vth gm-max (V)": 4,
+            "Vth constant-current (V)": 4,
             "SS (mV/dec)": 2,
             "μFE (cm²/V·s)": 3,
             "Vg @ gm_max (V)": 3,
@@ -1114,6 +1463,13 @@ with tab_batch:
     with b1:
         batch_smooth = st.number_input("Smoothing", min_value=1, max_value=31, value=5, step=2, key="batch_smooth")
         batch_ss = st.number_input("SS window", min_value=3, max_value=31, value=7, step=2, key="batch_ss")
+        batch_iref = st.number_input(
+            "Constant current Iref (A)",
+            min_value=1e-15,
+            value=1e-7,
+            format="%.1e",
+            key="batch_iref",
+        )
     with b2:
         batch_w = st.number_input("W (µm)", value=100.0, key="batch_w")
         batch_l = st.number_input("L (µm)", value=10.0, key="batch_l")
@@ -1162,6 +1518,7 @@ with tab_batch:
                         col_vd=batch_vd.strip(),
                         smoothing_window=int(batch_smooth),
                         ss_window=int(batch_ss),
+                        constant_current_A=float(batch_iref),
                         use_abs_id=batch_abs,
                         W_um=float(batch_w),
                         L_um=float(batch_l),
@@ -1175,6 +1532,10 @@ with tab_batch:
                         "Device": row["Device"],
                         "Forward": file_curves["Forward"],
                         "Reverse": file_curves["Reverse"],
+                        "Vg_gmmax_F": row["Vg@gmmax F (V)"],
+                        "gmmax_F": row["gm_max F (S)"],
+                        "Vg_gmmax_R": row["Vg@gmmax R (V)"],
+                        "gmmax_R": row["gm_max R (S)"],
                     }
                 except Exception as e:
                     errors.append({
@@ -1203,6 +1564,7 @@ with tab_batch:
                     eps0=float(batch_eps0),
                     smoothing=int(batch_smooth),
                     ss_window=int(batch_ss),
+                    constant_current_A=float(batch_iref),
                     col_vg=batch_vg.strip(),
                     col_id=batch_id.strip(),
                     col_ig=batch_ig.strip(),
@@ -1258,6 +1620,7 @@ with tab_batch:
         if success:
             numeric_cols = [
                 "Vth F (V)", "Vth R (V)", "Vth Hysteresis R-F (V)",
+                "Vth CC F (V)", "Vth CC R (V)", "Vth CC Hysteresis R-F (V)",
                 "gm_max F (S)", "gm_max R (S)",
                 "SS F (mV/dec)", "SS R (mV/dec)",
                 "muFE F (cm2/Vs)", "muFE R (cm2/Vs)",
@@ -1270,7 +1633,10 @@ with tab_batch:
                 "**평균 | "
                 f"Vth F={avg['Vth F (V)']:.4f} V, "
                 f"Vth R={avg['Vth R (V)']:.4f} V, "
-                f"Hys={avg['Vth Hysteresis R-F (V)']:.4f} V, "
+                f"Hys(gm)={avg['Vth Hysteresis R-F (V)']:.4f} V, "
+                f"Vth CC F={avg['Vth CC F (V)']:.4f} V, "
+                f"Vth CC R={avg['Vth CC R (V)']:.4f} V, "
+                f"Hys(CC)={avg['Vth CC Hysteresis R-F (V)']:.4f} V, "
                 f"SS F={avg['SS F (mV/dec)']:.2f} mV/dec, "
                 f"SS R={avg['SS R (mV/dec)']:.2f} mV/dec, "
                 f"μFE F={avg['muFE F (cm2/Vs)']:.3f}, "
@@ -1282,6 +1648,7 @@ with tab_batch:
             display_cols = [
                 "Device", "Sheet",
                 "Vth F (V)", "Vth R (V)", "Vth Hysteresis R-F (V)",
+                "Vth CC F (V)", "Vth CC R (V)", "Vth CC Hysteresis R-F (V)",
                 "gm_max F (S)", "gm_max R (S)",
                 "SS F (mV/dec)", "SS R (mV/dec)",
                 "muFE F (cm2/Vs)", "muFE R (cm2/Vs)",
@@ -1305,6 +1672,9 @@ with tab_batch:
                 "Vth F (V)": 4,
                 "Vth R (V)": 4,
                 "Vth Hysteresis R-F (V)": 4,
+                "Vth CC F (V)": 4,
+                "Vth CC R (V)": 4,
+                "Vth CC Hysteresis R-F (V)": 4,
                 "SS F (mV/dec)": 2,
                 "SS R (mV/dec)": 2,
                 "muFE F (cm2/Vs)": 3,
@@ -1318,6 +1688,52 @@ with tab_batch:
                     )
 
             st.dataframe(batch_display_df, use_container_width=True, hide_index=True)
+
+            # ----------------------------------------------------
+            # Device-to-device variation / uniformity
+            # ----------------------------------------------------
+            with st.expander("특성값 분산 / 균일도 보기", expanded=False):
+                st.caption(
+                    "Std는 표준편차, Variance는 분산, CV는 평균 대비 상대 편차입니다. "
+                    "같은 조건의 소자 균일성을 비교할 때는 보통 Std와 CV가 작을수록 균일합니다."
+                )
+
+                stats_df = statistics_dataframe(result_df)
+                stats_display_df = format_statistics_for_display(stats_df)
+                st.dataframe(
+                    stats_display_df,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                selected_variation_metric = st.selectbox(
+                    "분산 그래프로 볼 특성값",
+                    options=list(VARIABILITY_METRICS.keys()),
+                    key="batch_variation_metric",
+                )
+
+                variation_fig = make_variability_figure(
+                    result_df, selected_variation_metric
+                )
+                display_centered_figure(variation_fig)
+                st.caption(
+                    "실선+점 = 각 소자의 값, 점선 = 평균, 옅은 영역 = 평균 ± 1σ(표준편차)"
+                )
+
+                variation_png = figure_to_png_bytes(variation_fig, dpi=300)
+                safe_metric_name = (
+                    selected_variation_metric
+                    .replace("/", "_")
+                    .replace(" ", "_")
+                    .replace("μ", "mu")
+                )
+                st.download_button(
+                    "분산 그래프 이미지 다운로드",
+                    data=variation_png,
+                    file_name=f"TFT_Batch_Variation_{safe_metric_name}.png",
+                    mime="image/png",
+                    key="batch_variation_download",
+                )
 
             bp1, bp2, bp3 = st.tabs(["Linear Id-Vg", "Log Id+Ig-Vg", "gm-Vg"])
             with bp1:
@@ -1356,7 +1772,8 @@ with tab_batch:
 
 st.divider()
 st.caption(
-    "Calculation: gm = dId/dVg · Vth = gm-max tangent method · "
+    "Calculation: gm = dId/dVg · Vth(gm-max) = gm-max tangent method · "
+    "Vth(constant-current) = Vg at |Id| = Iref · "
     "SS = max positive slope of log10(|Id|)-Vg · "
     "μFE = (L/W)·gm_max/(Cox·Vd)"
 )
