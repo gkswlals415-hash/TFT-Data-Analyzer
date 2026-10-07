@@ -781,89 +781,121 @@ def make_batch_figures(curves: dict):
     ax2.legend(handles=style_handles, title="Current / Sweep", fontsize=8, loc="lower right")
     fig2.tight_layout()
 
-    # gm
+    # gm - Forward only
     fig3 = Figure(figsize=(12, 6), dpi=100)
     ax3 = fig3.add_subplot(111)
-    gm_device_handles = []
+    gm_f_handles = []
 
     for item in curves.values():
         device = item["Device"]
         f = item["Forward"]
-        r = item["Reverse"]
 
-        # 같은 소자는 같은 색상, Forward=실선 / Reverse=점선
-        line_f, = ax3.plot(f["Vg"], f["gm"], linewidth=1.5)
-        device_color = line_f.get_color()
-        ax3.plot(
-            r["Vg"], r["gm"], linestyle="--", linewidth=1.2,
-            color=device_color, label="_nolegend_"
+        line_f, = ax3.plot(
+            f["Vg"], f["gm"], linewidth=1.5, label=device
         )
+        device_color = line_f.get_color()
 
-        # 각 sweep의 gm_max 위치를 직접 표시
         x_f = item.get("Vg_gmmax_F", np.nan)
         y_f = item.get("gmmax_F", np.nan)
         if np.isfinite(x_f) and np.isfinite(y_f):
             ax3.scatter(
                 [x_f], [y_f],
-                s=48, marker="o",
+                s=52, marker="o",
                 color=device_color,
-                edgecolors="black", linewidths=0.55,
+                edgecolors="black", linewidths=0.6,
                 zorder=6, label="_nolegend_",
             )
 
-        x_r = item.get("Vg_gmmax_R", np.nan)
-        y_r = item.get("gmmax_R", np.nan)
-        if np.isfinite(x_r) and np.isfinite(y_r):
-            ax3.scatter(
-                [x_r], [y_r],
-                s=52, marker="s",
-                color=device_color,
-                edgecolors="black", linewidths=0.55,
-                zorder=6, label="_nolegend_",
-            )
-
-        gm_device_handles.append(
+        gm_f_handles.append(
             Line2D([0], [0], color=device_color, linewidth=1.8, label=device)
         )
 
     ax3.set_xlabel("Gate Voltage, Vg (V)")
     ax3.set_ylabel("Transconductance, gm (S)")
-    ax3.set_title("All Devices - gm-Vg with gm_max points")
+    ax3.set_title("All Devices - Forward gm-Vg")
     ax3.grid(True, alpha=0.25)
 
-    # Device 색상 legend
-    if gm_device_handles:
-        gm_device_legend = ax3.legend(
-            handles=gm_device_handles,
+    if gm_f_handles:
+        dev_leg_f = ax3.legend(
+            handles=gm_f_handles,
             title="Device",
             fontsize=8,
-            ncol=max(1, min(5, len(gm_device_handles))),
+            ncol=max(1, min(5, len(gm_f_handles))),
             loc="upper left",
         )
-        ax3.add_artist(gm_device_legend)
+        ax3.add_artist(dev_leg_f)
 
-    # Forward / Reverse + gm_max marker legend
-    gm_style_handles = [
-        Line2D(
-            [0], [0], color="black", linestyle="-", linewidth=1.5,
-            marker="o", markersize=6, markeredgecolor="black",
-            label="Forward / gm_max",
-        ),
-        Line2D(
-            [0], [0], color="black", linestyle="--", linewidth=1.2,
-            marker="s", markersize=6, markeredgecolor="black",
-            label="Reverse / gm_max",
-        ),
-    ]
     ax3.legend(
-        handles=gm_style_handles,
-        title="Sweep / gm_max",
+        handles=[
+            Line2D(
+                [0], [0], color="black", linestyle="-", linewidth=1.5,
+                marker="o", markersize=6, markeredgecolor="black",
+                label="gm_max",
+            )
+        ],
         fontsize=8,
         loc="lower right",
     )
     fig3.tight_layout()
 
-    return fig1, fig2, fig3
+    # gm - Reverse only
+    fig4 = Figure(figsize=(12, 6), dpi=100)
+    ax4 = fig4.add_subplot(111)
+    gm_r_handles = []
+
+    for item in curves.values():
+        device = item["Device"]
+        r = item["Reverse"]
+
+        line_r, = ax4.plot(
+            r["Vg"], r["gm"], linestyle="--", linewidth=1.5, label=device
+        )
+        device_color = line_r.get_color()
+
+        x_r = item.get("Vg_gmmax_R", np.nan)
+        y_r = item.get("gmmax_R", np.nan)
+        if np.isfinite(x_r) and np.isfinite(y_r):
+            ax4.scatter(
+                [x_r], [y_r],
+                s=56, marker="s",
+                color=device_color,
+                edgecolors="black", linewidths=0.6,
+                zorder=6, label="_nolegend_",
+            )
+
+        gm_r_handles.append(
+            Line2D([0], [0], color=device_color, linewidth=1.8, linestyle="--", label=device)
+        )
+
+    ax4.set_xlabel("Gate Voltage, Vg (V)")
+    ax4.set_ylabel("Transconductance, gm (S)")
+    ax4.set_title("All Devices - Reverse gm-Vg")
+    ax4.grid(True, alpha=0.25)
+
+    if gm_r_handles:
+        dev_leg_r = ax4.legend(
+            handles=gm_r_handles,
+            title="Device",
+            fontsize=8,
+            ncol=max(1, min(5, len(gm_r_handles))),
+            loc="upper left",
+        )
+        ax4.add_artist(dev_leg_r)
+
+    ax4.legend(
+        handles=[
+            Line2D(
+                [0], [0], color="black", linestyle="--", linewidth=1.5,
+                marker="s", markersize=6, markeredgecolor="black",
+                label="gm_max",
+            )
+        ],
+        fontsize=8,
+        loc="lower right",
+    )
+    fig4.tight_layout()
+
+    return fig1, fig2, fig3, fig4
 
 
 
@@ -1263,7 +1295,7 @@ with tab_single:
         single_iref = st.number_input(
             "Constant current Iref (A)",
             min_value=1e-15,
-            value=1e-7,
+            value=1e-6,
             format="%.1e",
             key="single_iref",
         )
@@ -1466,7 +1498,7 @@ with tab_batch:
         batch_iref = st.number_input(
             "Constant current Iref (A)",
             min_value=1e-15,
-            value=1e-7,
+            value=1e-6,
             format="%.1e",
             key="batch_iref",
         )
@@ -1576,7 +1608,8 @@ with tab_batch:
                     [
                         "TFT_Batch_Linear_Id_Overlay.png",
                         "TFT_Batch_Log_Id_Ig_Overlay.png",
-                        "TFT_Batch_gm_Overlay.png",
+                        "TFT_Batch_gm_Forward.png",
+                        "TFT_Batch_gm_Reverse.png",
                     ],
                     dpi=300,
                 )
@@ -1629,20 +1662,51 @@ with tab_batch:
             ]
             avg = result_df[numeric_cols].apply(pd.to_numeric, errors="coerce").mean()
 
-            st.markdown(
-                "**평균 | "
-                f"Vth F={avg['Vth F (V)']:.4f} V, "
-                f"Vth R={avg['Vth R (V)']:.4f} V, "
-                f"Hys(gm)={avg['Vth Hysteresis R-F (V)']:.4f} V, "
-                f"Vth CC F={avg['Vth CC F (V)']:.4f} V, "
-                f"Vth CC R={avg['Vth CC R (V)']:.4f} V, "
-                f"Hys(CC)={avg['Vth CC Hysteresis R-F (V)']:.4f} V, "
-                f"SS F={avg['SS F (mV/dec)']:.2f} mV/dec, "
-                f"SS R={avg['SS R (mV/dec)']:.2f} mV/dec, "
-                f"μFE F={avg['muFE F (cm2/Vs)']:.3f}, "
-                f"μFE R={avg['muFE R (cm2/Vs)']:.3f} cm²/V·s, "
-                f"ON/OFF F={avg['ON/OFF F']:.6e}, "
-                f"ON/OFF R={avg['ON/OFF R']:.6e}**"
+            # Batch 평균값을 한눈에 보기 쉬운 표로 표시
+            st.markdown("#### Batch 평균값")
+
+            avg_table = pd.DataFrame([
+                {
+                    "특성값": "Vth (gm-max)",
+                    "Forward 평균": f"{avg['Vth F (V)']:.4f}",
+                    "Reverse 평균": f"{avg['Vth R (V)']:.4f}",
+                    "Hysteresis R-F": f"{avg['Vth Hysteresis R-F (V)']:.4f}",
+                    "단위": "V",
+                },
+                {
+                    "특성값": "Vth (Constant Current)",
+                    "Forward 평균": f"{avg['Vth CC F (V)']:.4f}",
+                    "Reverse 평균": f"{avg['Vth CC R (V)']:.4f}",
+                    "Hysteresis R-F": f"{avg['Vth CC Hysteresis R-F (V)']:.4f}",
+                    "단위": "V",
+                },
+                {
+                    "특성값": "SS",
+                    "Forward 평균": f"{avg['SS F (mV/dec)']:.2f}",
+                    "Reverse 평균": f"{avg['SS R (mV/dec)']:.2f}",
+                    "Hysteresis R-F": "-",
+                    "단위": "mV/dec",
+                },
+                {
+                    "특성값": "μFE",
+                    "Forward 평균": f"{avg['muFE F (cm2/Vs)']:.3f}",
+                    "Reverse 평균": f"{avg['muFE R (cm2/Vs)']:.3f}",
+                    "Hysteresis R-F": "-",
+                    "단위": "cm²/V·s",
+                },
+                {
+                    "특성값": "ON/OFF",
+                    "Forward 평균": f"{avg['ON/OFF F']:.6e}",
+                    "Reverse 평균": f"{avg['ON/OFF R']:.6e}",
+                    "Hysteresis R-F": "-",
+                    "단위": "-",
+                },
+            ])
+
+            st.dataframe(
+                avg_table,
+                use_container_width=True,
+                hide_index=True,
             )
 
             display_cols = [
@@ -1735,13 +1799,22 @@ with tab_batch:
                     key="batch_variation_download",
                 )
 
-            bp1, bp2, bp3 = st.tabs(["Linear Id-Vg", "Log Id+Ig-Vg", "gm-Vg"])
+            st.caption("Batch gm 그래프는 Forward와 Reverse를 분리해서 표시하며, 각 그래프의 마커가 gm_max 위치입니다.")
+
+            bp1, bp2, bp3, bp4 = st.tabs([
+                "Linear Id-Vg",
+                "Log Id+Ig-Vg",
+                "gm-Vg Forward",
+                "gm-Vg Reverse",
+            ])
             with bp1:
                 display_centered_figure(batch_payload["figs"][0])
             with bp2:
                 display_centered_figure(batch_payload["figs"][1])
             with bp3:
                 display_centered_figure(batch_payload["figs"][2])
+            with bp4:
+                display_centered_figure(batch_payload["figs"][3])
 
             bdl1, bdl2 = st.columns(2)
 
