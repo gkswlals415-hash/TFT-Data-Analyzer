@@ -504,9 +504,9 @@ def analyze_batch_file(
 
     f = results["Forward"]
     r = results["Reverse"]
-    hysteresis = r["Vth_V"] - f["Vth_V"]
+    hysteresis = abs(r["Vth_V"] - f["Vth_V"])
     hysteresis_cc = (
-        r["Vth_CC_V"] - f["Vth_CC_V"]
+        abs(r["Vth_CC_V"] - f["Vth_CC_V"])
         if np.isfinite(r["Vth_CC_V"]) and np.isfinite(f["Vth_CC_V"])
         else np.nan
     )
@@ -519,10 +519,10 @@ def analyze_batch_file(
         "Sheet": sheet_name,
         "Vth F (V)": f["Vth_V"],
         "Vth R (V)": r["Vth_V"],
-        "Vth Hysteresis R-F (V)": hysteresis,
+        "Vth Hysteresis |R-F| (V)": hysteresis,
         "Vth CC F (V)": f["Vth_CC_V"],
         "Vth CC R (V)": r["Vth_CC_V"],
-        "Vth CC Hysteresis R-F (V)": hysteresis_cc,
+        "Vth CC Hysteresis |R-F| (V)": hysteresis_cc,
         "Constant Current Iref (A)": f["Constant_Current_A"],
         "gm_max F (S)": f["gm_max_S"],
         "gm_max R (S)": r["gm_max_S"],
@@ -940,7 +940,7 @@ def build_single_excel(
     output = io.BytesIO()
 
     if "Forward" in results and "Reverse" in results:
-        hys = results["Reverse"]["Vth_V"] - results["Forward"]["Vth_V"]
+        hys = abs(results["Reverse"]["Vth_V"] - results["Forward"]["Vth_V"])
     else:
         hys = np.nan
 
@@ -961,7 +961,7 @@ def build_single_excel(
             "L (um)": L_um,
             "eps_r": eps_r,
             "tox (nm)": tox_nm,
-            "Vth Hysteresis R-F (V)": hys,
+            "Vth Hysteresis |R-F| (V)": hys,
             "gm_max (S)": r["gm_max_S"],
             "Vg @ gm_max (V)": r["Vg_at_gmmax_V"],
             "Id @ gm_max (A)": r["Id_at_gmmax_A"],
@@ -1000,10 +1000,10 @@ def statistics_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     metrics = [
         "Vth F (V)",
         "Vth R (V)",
-        "Vth Hysteresis R-F (V)",
+        "Vth Hysteresis |R-F| (V)",
         "Vth CC F (V)",
         "Vth CC R (V)",
-        "Vth CC Hysteresis R-F (V)",
+        "Vth CC Hysteresis |R-F| (V)",
         "gm_max F (S)",
         "gm_max R (S)",
         "SS F (mV/dec)",
@@ -1086,13 +1086,13 @@ VARIABILITY_METRICS = {
         "log": True,
     },
     "Vth Hysteresis (gm-max)": {
-        "columns": ["Vth Hysteresis R-F (V)"],
+        "columns": ["Vth Hysteresis |R-F| (V)"],
         "labels": ["Hysteresis"],
         "ylabel": "Vth Hysteresis (V)",
         "log": False,
     },
     "Vth Hysteresis (constant-current)": {
-        "columns": ["Vth CC Hysteresis R-F (V)"],
+        "columns": ["Vth CC Hysteresis |R-F| (V)"],
         "labels": ["Hysteresis"],
         "ylabel": "Vth CC Hysteresis (V)",
         "log": False,
@@ -1187,10 +1187,10 @@ def format_statistics_for_display(stats_df: pd.DataFrame) -> pd.DataFrame:
 OUTLIER_METRICS = {
     "Vth F (gm-max)": "Vth F (V)",
     "Vth R (gm-max)": "Vth R (V)",
-    "Vth Hysteresis (gm-max)": "Vth Hysteresis R-F (V)",
+    "Vth Hysteresis (gm-max)": "Vth Hysteresis |R-F| (V)",
     "Vth CC F": "Vth CC F (V)",
     "Vth CC R": "Vth CC R (V)",
-    "Vth CC Hysteresis": "Vth CC Hysteresis R-F (V)",
+    "Vth CC Hysteresis": "Vth CC Hysteresis |R-F| (V)",
     "gm_max F": "gm_max F (S)",
     "gm_max R": "gm_max R (S)",
     "SS F": "SS F (mV/dec)",
@@ -1343,6 +1343,7 @@ def build_batch_excel(
 for key, default in {
     "single_payload": None,
     "batch_payload": None,
+    "batch_uploader_version": 0,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -1474,19 +1475,19 @@ with tab_single:
         )
 
         if "Forward" in results and "Reverse" in results:
-            hys = results["Reverse"]["Vth_V"] - results["Forward"]["Vth_V"]
+            hys = abs(results["Reverse"]["Vth_V"] - results["Forward"]["Vth_V"])
             f = results["Forward"]
             r = results["Reverse"]
 
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Vth gm-max F", f"{f['Vth_V']:.4f} V")
             m2.metric("Vth gm-max R", f"{r['Vth_V']:.4f} V")
-            m3.metric("gm-max Hysteresis R-F", f"{hys:.4f} V")
+            m3.metric("gm-max Hysteresis |R-F|", f"{hys:.4f} V")
             m4.metric("SS F", f"{f['SS_mV_dec']:.2f} mV/dec" if np.isfinite(f['SS_mV_dec']) else "N/A")
             m5.metric("μFE F", f"{f['mu_FE_cm2_Vs']:.3f} cm²/V·s" if np.isfinite(f['mu_FE_cm2_Vs']) else "N/A")
 
             hys_cc = (
-                r["Vth_CC_V"] - f["Vth_CC_V"]
+                abs(r["Vth_CC_V"] - f["Vth_CC_V"])
                 if np.isfinite(r["Vth_CC_V"]) and np.isfinite(f["Vth_CC_V"])
                 else np.nan
             )
@@ -1500,7 +1501,7 @@ with tab_single:
                 f"{r['Vth_CC_V']:.4f} V" if np.isfinite(r['Vth_CC_V']) else "N/A",
             )
             cc3.metric(
-                "CC Hysteresis R-F",
+                "CC Hysteresis |R-F|",
                 f"{hys_cc:.4f} V" if np.isfinite(hys_cc) else "N/A",
             )
 
@@ -1571,12 +1572,39 @@ with tab_single:
 with tab_batch:
     st.subheader("Batch TFT Analyzer")
 
-    batch_files = st.file_uploader(
-        "여러 TFT 측정 Excel 파일 업로드",
-        type=["xls", "xlsx"],
-        accept_multiple_files=True,
-        key="batch_files",
-    )
+    upload_col, clear_col = st.columns([5, 1])
+
+    with upload_col:
+        batch_files = st.file_uploader(
+            "여러 TFT 측정 Excel 파일 업로드",
+            type=["xls", "xlsx"],
+            accept_multiple_files=True,
+            key=f"batch_files_{st.session_state.batch_uploader_version}",
+        )
+
+    with clear_col:
+        st.write("")
+        st.write("")
+        if st.button(
+            "파일 모두 삭제",
+            key="batch_clear_all_files",
+            use_container_width=True,
+        ):
+            # file_uploader는 값을 직접 비울 수 없으므로 key를 새로 만들어 초기화합니다.
+            st.session_state.batch_uploader_version += 1
+            st.session_state.batch_payload = None
+
+            # 이전 Batch 분석/이상치 선택 상태도 함께 초기화합니다.
+            for state_key in [
+                "batch_outlier_mode",
+                "batch_outlier_metrics",
+                "batch_iqr_multiplier",
+                "batch_manual_outliers",
+                "batch_variation_metric",
+            ]:
+                st.session_state.pop(state_key, None)
+
+            st.rerun()
 
     b1, b2, b3, b4 = st.columns(4)
     with b1:
@@ -1859,8 +1887,8 @@ with tab_batch:
             )
 
             numeric_cols = [
-                "Vth F (V)", "Vth R (V)", "Vth Hysteresis R-F (V)",
-                "Vth CC F (V)", "Vth CC R (V)", "Vth CC Hysteresis R-F (V)",
+                "Vth F (V)", "Vth R (V)", "Vth Hysteresis |R-F| (V)",
+                "Vth CC F (V)", "Vth CC R (V)", "Vth CC Hysteresis |R-F| (V)",
                 "gm_max F (S)", "gm_max R (S)",
                 "SS F (mV/dec)", "SS R (mV/dec)",
                 "muFE F (cm2/Vs)", "muFE R (cm2/Vs)",
@@ -1880,35 +1908,35 @@ with tab_batch:
                     "특성값": "Vth (gm-max)",
                     "Forward 평균": f"{avg['Vth F (V)']:.4f}",
                     "Reverse 평균": f"{avg['Vth R (V)']:.4f}",
-                    "Hysteresis R-F": f"{avg['Vth Hysteresis R-F (V)']:.4f}",
+                    "Hysteresis |R-F|": f"{avg['Vth Hysteresis |R-F| (V)']:.4f}",
                     "단위": "V",
                 },
                 {
                     "특성값": "Vth (Constant Current)",
                     "Forward 평균": f"{avg['Vth CC F (V)']:.4f}",
                     "Reverse 평균": f"{avg['Vth CC R (V)']:.4f}",
-                    "Hysteresis R-F": f"{avg['Vth CC Hysteresis R-F (V)']:.4f}",
+                    "Hysteresis |R-F|": f"{avg['Vth CC Hysteresis |R-F| (V)']:.4f}",
                     "단위": "V",
                 },
                 {
                     "특성값": "SS",
                     "Forward 평균": f"{avg['SS F (mV/dec)']:.2f}",
                     "Reverse 평균": f"{avg['SS R (mV/dec)']:.2f}",
-                    "Hysteresis R-F": "-",
+                    "Hysteresis |R-F|": "-",
                     "단위": "mV/dec",
                 },
                 {
                     "특성값": "μFE",
                     "Forward 평균": f"{avg['muFE F (cm2/Vs)']:.3f}",
                     "Reverse 평균": f"{avg['muFE R (cm2/Vs)']:.3f}",
-                    "Hysteresis R-F": "-",
+                    "Hysteresis |R-F|": "-",
                     "단위": "cm²/V·s",
                 },
                 {
                     "특성값": "ON/OFF",
                     "Forward 평균": f"{avg['ON/OFF F']:.6e}",
                     "Reverse 평균": f"{avg['ON/OFF R']:.6e}",
-                    "Hysteresis R-F": "-",
+                    "Hysteresis |R-F|": "-",
                     "단위": "-",
                 },
             ])
@@ -1921,8 +1949,8 @@ with tab_batch:
 
             display_cols = [
                 "Device", "사용 여부", "Sheet",
-                "Vth F (V)", "Vth R (V)", "Vth Hysteresis R-F (V)",
-                "Vth CC F (V)", "Vth CC R (V)", "Vth CC Hysteresis R-F (V)",
+                "Vth F (V)", "Vth R (V)", "Vth Hysteresis |R-F| (V)",
+                "Vth CC F (V)", "Vth CC R (V)", "Vth CC Hysteresis |R-F| (V)",
                 "gm_max F (S)", "gm_max R (S)",
                 "SS F (mV/dec)", "SS R (mV/dec)",
                 "muFE F (cm2/Vs)", "muFE R (cm2/Vs)",
@@ -1945,10 +1973,10 @@ with tab_batch:
             batch_fixed_formats = {
                 "Vth F (V)": 4,
                 "Vth R (V)": 4,
-                "Vth Hysteresis R-F (V)": 4,
+                "Vth Hysteresis |R-F| (V)": 4,
                 "Vth CC F (V)": 4,
                 "Vth CC R (V)": 4,
-                "Vth CC Hysteresis R-F (V)": 4,
+                "Vth CC Hysteresis |R-F| (V)": 4,
                 "SS F (mV/dec)": 2,
                 "SS R (mV/dec)": 2,
                 "muFE F (cm2/Vs)": 3,
