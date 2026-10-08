@@ -179,6 +179,8 @@ def analyze_sweep(
     smoothing_window: int = 5,
     ss_window: int = 7,
     constant_current_A: float = 1e-6,
+    gm_search_vmin: float | None = None,
+    gm_search_vmax: float | None = None,
 ) -> tuple[dict, pd.DataFrame]:
     data = seg.copy()
 
@@ -223,6 +225,20 @@ def analyze_sweep(
         candidate = valid_indices
     if len(candidate) == 0:
         candidate = valid_indices
+
+    # gm_max 탐색 Vg 범위를 선택적으로 제한합니다.
+    # Reverse에서 예를 들어 -10 V ~ 8 V만 사용하면 10 V 부근 끝단 피크가 제외됩니다.
+    if gm_search_vmin is not None:
+        candidate = candidate[vg[candidate] >= float(gm_search_vmin)]
+    if gm_search_vmax is not None:
+        candidate = candidate[vg[candidate] <= float(gm_search_vmax)]
+
+    if len(candidate) == 0:
+        range_text = (
+            f"{gm_search_vmin if gm_search_vmin is not None else '-∞'} ~ "
+            f"{gm_search_vmax if gm_search_vmax is not None else '+∞'} V"
+        )
+        raise ValueError(f"gm_max 탐색 범위({range_text}) 안에 유효한 데이터가 없습니다.")
 
     idx = int(candidate[np.nanargmax(gm[candidate])])
     gm_max = float(gm[idx])
@@ -337,6 +353,8 @@ def analyze_sweep(
         "Smoothing_Window": win,
         "SS_Window": ss_window,
         "gm_index": idx,
+        "gm_Search_Vmin_V": gm_search_vmin if gm_search_vmin is not None else np.nan,
+        "gm_Search_Vmax_V": gm_search_vmax if gm_search_vmax is not None else np.nan,
     }
     return result, data
 
@@ -386,6 +404,8 @@ def analyze_single_file(
     smoothing_window: int,
     ss_window: int,
     constant_current_A: float,
+    reverse_gm_search_start_v: float | None = None,
+    reverse_gm_search_end_v: float | None = None,
     use_abs_id: bool,
     W_um: float,
     L_um: float,
@@ -419,11 +439,16 @@ def analyze_single_file(
             vd_raw[sl] if vd_raw is not None else None,
             use_abs_id=use_abs_id,
         )
+        gm_vmin = reverse_gm_search_start_v if label == "Reverse" else None
+        gm_vmax = reverse_gm_search_end_v if label == "Reverse" else None
+
         result, analyzed = analyze_sweep(
             seg,
             smoothing_window=smoothing_window,
             ss_window=ss_window,
             constant_current_A=constant_current_A,
+            gm_search_vmin=gm_vmin,
+            gm_search_vmax=gm_vmax,
         )
         result = add_mobility(
             result,
@@ -474,6 +499,8 @@ def analyze_batch_file(
     smoothing_window: int,
     ss_window: int,
     constant_current_A: float,
+    reverse_gm_search_start_v: float = -10.0,
+    reverse_gm_search_end_v: float | None = None,
     use_abs_id: bool,
     W_um: float,
     L_um: float,
@@ -491,6 +518,8 @@ def analyze_batch_file(
         smoothing_window=smoothing_window,
         ss_window=ss_window,
         constant_current_A=constant_current_A,
+        reverse_gm_search_start_v=reverse_gm_search_start_v,
+        reverse_gm_search_end_v=reverse_gm_search_end_v,
         use_abs_id=use_abs_id,
         W_um=W_um,
         L_um=L_um,
@@ -524,6 +553,8 @@ def analyze_batch_file(
         "Vth CC R (V)": r["Vth_CC_V"],
         "Vth CC Hysteresis |R-F| (V)": hysteresis_cc,
         "Constant Current Iref (A)": f["Constant_Current_A"],
+        "Reverse gm search start (V)": reverse_gm_search_start_v,
+        "Reverse gm search end (V)": reverse_gm_search_end_v if reverse_gm_search_end_v is not None else np.nan,
         "gm_max F (S)": f["gm_max_S"],
         "gm_max R (S)": r["gm_max_S"],
         "SS F (mV/dec)": f["SS_mV_dec"],
@@ -1268,6 +1299,8 @@ def build_batch_excel(
     smoothing: int,
     ss_window: int,
     constant_current_A: float,
+    reverse_gm_search_start_v: float,
+    reverse_gm_search_end_v: float,
     col_vg: str,
     col_id: str,
     col_ig: str,
@@ -1303,6 +1336,8 @@ def build_batch_excel(
         {"Parameter": "Smoothing window", "Value": smoothing, "Unit": "points"},
         {"Parameter": "SS window", "Value": ss_window, "Unit": "points"},
         {"Parameter": "Constant current Iref", "Value": constant_current_A, "Unit": "A"},
+        {"Parameter": "Reverse gm search start", "Value": reverse_gm_search_start_v, "Unit": "V"},
+        {"Parameter": "Reverse gm search end", "Value": reverse_gm_search_end_v, "Unit": "V"},
         {"Parameter": "Vg column", "Value": col_vg, "Unit": ""},
         {"Parameter": "Id column", "Value": col_id, "Unit": ""},
         {"Parameter": "Ig column", "Value": col_ig, "Unit": ""},
@@ -1617,6 +1652,16 @@ with tab_batch:
             format="%.1e",
             key="batch_iref",
         )
+        batch_reverse_gm_end = st.number_input(
+            "Reverse gm_max 탐색 끝 Vg (V)",
+            min_value=-10.0,
+            max_value=10.0,
+            value=8.0,
+            step=0.1,
+            format="%.1f",
+            key="batch_reverse_gm_end",
+            help="Reverse gm_max는 -10 V부터 이 값까지의 구간에서만 찾습니다. 예: 8.0 V이면 8~10 V의 끝단 피크는 제외됩니다.",
+        )
     with b2:
         batch_w = st.number_input("W (µm)", value=100.0, key="batch_w")
         batch_l = st.number_input("L (µm)", value=10.0, key="batch_l")
@@ -1682,6 +1727,8 @@ with tab_batch:
                         smoothing_window=int(batch_smooth),
                         ss_window=int(batch_ss),
                         constant_current_A=float(batch_iref),
+                        reverse_gm_search_start_v=-10.0,
+                        reverse_gm_search_end_v=float(batch_reverse_gm_end),
                         use_abs_id=batch_abs,
                         W_um=float(batch_w),
                         L_um=float(batch_l),
@@ -1699,6 +1746,8 @@ with tab_batch:
                         "gmmax_F": row["gm_max F (S)"],
                         "Vg_gmmax_R": row["Vg@gmmax R (V)"],
                         "gmmax_R": row["gm_max R (S)"],
+                        "Reverse_gm_search_start": -10.0,
+                        "Reverse_gm_search_end": float(batch_reverse_gm_end),
                     }
                 except Exception as e:
                     errors.append({
@@ -1728,6 +1777,8 @@ with tab_batch:
                     smoothing=int(batch_smooth),
                     ss_window=int(batch_ss),
                     constant_current_A=float(batch_iref),
+                    reverse_gm_search_start_v=-10.0,
+                    reverse_gm_search_end_v=float(batch_reverse_gm_end),
                     col_vg=batch_vg.strip(),
                     col_id=batch_id.strip(),
                     col_ig=batch_ig.strip(),
@@ -1782,6 +1833,42 @@ with tab_batch:
                 st.dataframe(batch_payload["detected"], use_container_width=True, hide_index=True)
 
         if success:
+            # ----------------------------------------------------
+            # 이전 버전(v8.4 이하) session_state 결과와의 호환성 보정
+            # v8.5에서 Hysteresis 열 이름을 |R-F| 표기로 변경했기 때문에
+            # 기존 세션의 DataFrame에 새 열이 없으면 여기서 자동 생성합니다.
+            # ----------------------------------------------------
+            result_df = result_df.copy()
+
+            hys_col = "Vth Hysteresis |R-F| (V)"
+            old_hys_col = "Vth Hysteresis R-F (V)"
+            if hys_col not in result_df.columns:
+                if old_hys_col in result_df.columns:
+                    result_df[hys_col] = pd.to_numeric(
+                        result_df[old_hys_col], errors="coerce"
+                    ).abs()
+                elif "Vth F (V)" in result_df.columns and "Vth R (V)" in result_df.columns:
+                    result_df[hys_col] = (
+                        pd.to_numeric(result_df["Vth R (V)"], errors="coerce")
+                        - pd.to_numeric(result_df["Vth F (V)"], errors="coerce")
+                    ).abs()
+
+            hys_cc_col = "Vth CC Hysteresis |R-F| (V)"
+            old_hys_cc_col = "Vth CC Hysteresis R-F (V)"
+            if hys_cc_col not in result_df.columns:
+                if old_hys_cc_col in result_df.columns:
+                    result_df[hys_cc_col] = pd.to_numeric(
+                        result_df[old_hys_cc_col], errors="coerce"
+                    ).abs()
+                elif "Vth CC F (V)" in result_df.columns and "Vth CC R (V)" in result_df.columns:
+                    result_df[hys_cc_col] = (
+                        pd.to_numeric(result_df["Vth CC R (V)"], errors="coerce")
+                        - pd.to_numeric(result_df["Vth CC F (V)"], errors="coerce")
+                    ).abs()
+
+            # 보정된 결과를 현재 세션에도 다시 저장
+            batch_payload["results"] = result_df
+
             # ----------------------------------------------------
             # Outlier filtering (원본 결과는 삭제하지 않음)
             # ----------------------------------------------------
@@ -2037,7 +2124,11 @@ with tab_batch:
                     key="batch_variation_download",
                 )
 
-            st.caption("Batch gm 그래프는 Forward와 Reverse를 분리해서 표시하며, 각 그래프의 마커가 gm_max 위치입니다.")
+            st.caption(
+                f"Batch gm 그래프는 Forward와 Reverse를 분리해서 표시합니다. "
+                f"Reverse gm_max는 -10.0 V ~ {float(batch_reverse_gm_end):.1f} V 범위에서만 탐색하며, "
+                "각 그래프의 마커가 선택된 gm_max 위치입니다."
+            )
 
             active_device_names = set(active_df["Device"].astype(str))
             active_curves = {
@@ -2075,6 +2166,8 @@ with tab_batch:
                 smoothing=int(batch_smooth),
                 ss_window=int(batch_ss),
                 constant_current_A=float(batch_iref),
+                reverse_gm_search_start_v=-10.0,
+                reverse_gm_search_end_v=float(batch_reverse_gm_end),
                 col_vg=batch_vg.strip(),
                 col_id=batch_id.strip(),
                 col_ig=batch_ig.strip(),
