@@ -1422,6 +1422,16 @@ with tab_single:
             format="%.1e",
             key="single_iref",
         )
+        single_reverse_gm_end = st.number_input(
+            "Reverse gm_max 탐색 끝 Vg (V)",
+            min_value=-10.0,
+            max_value=10.0,
+            value=8.0,
+            step=0.1,
+            format="%.1f",
+            key="single_reverse_gm_end",
+            help="Single 분석에서도 Reverse gm_max는 -10 V부터 이 값까지의 구간에서만 찾습니다. 예: 8.0 V이면 8~10 V 끝단 피크를 제외합니다.",
+        )
     with c2:
         single_w = st.number_input("W (µm)", value=100.0, key="single_w")
         single_l = st.number_input("L (µm)", value=10.0, key="single_l")
@@ -1435,6 +1445,11 @@ with tab_single:
         single_id = st.text_input("Id 열", "AI", key="single_id")
         single_ig = st.text_input("Ig 열", "BI", key="single_ig")
         single_vd = st.text_input("Vd 열", "AV", key="single_vd")
+
+    st.caption(
+        f"Single Reverse gm_max 탐색 범위: -10.0 V ~ {float(single_reverse_gm_end):.1f} V "
+        "(Forward gm_max는 기존처럼 전체 sweep 범위에서 탐색)"
+    )
 
     if st.button("분석 실행", type="primary", key="single_run"):
         if single_file is None:
@@ -1454,6 +1469,8 @@ with tab_single:
                         smoothing_window=int(single_smooth),
                         ss_window=int(single_ss),
                         constant_current_A=float(single_iref),
+                        reverse_gm_search_start_v=-10.0,
+                        reverse_gm_search_end_v=float(single_reverse_gm_end),
                         use_abs_id=single_abs,
                         W_um=float(single_w),
                         L_um=float(single_l),
@@ -2076,7 +2093,24 @@ with tab_batch:
                         lambda x, d=decimals: fmt_num(x, d)
                     )
 
-            st.dataframe(batch_display_df, use_container_width=True, hide_index=True)
+            # 이상치로 제외된 소자는 결과표 전체 행을 연한 빨간색으로 강조
+            def highlight_excluded_row(row):
+                if str(row.get("사용 여부", "")) == "제외":
+                    return [
+                        "background-color: #ffd9d9; color: #8b0000;"
+                    ] * len(row)
+                return [""] * len(row)
+
+            batch_display_styled = batch_display_df.style.apply(
+                highlight_excluded_row,
+                axis=1,
+            )
+
+            st.dataframe(
+                batch_display_styled,
+                use_container_width=True,
+                hide_index=True,
+            )
 
             # ----------------------------------------------------
             # Device-to-device variation / uniformity
