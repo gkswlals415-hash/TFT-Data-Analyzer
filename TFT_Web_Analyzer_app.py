@@ -359,6 +359,94 @@ def analyze_sweep(
     return result, data
 
 
+def interpolate_current_at_vg(
+    analyzed: pd.DataFrame,
+    target_vg: float,
+    current_column: str = "Id_smooth",
+) -> float:
+    """특정 Vg에서의 |Id|를 log10(|Id|)-Vg 공간에서 보간합니다."""
+    if not np.isfinite(target_vg) or current_column not in analyzed.columns:
+        return np.nan
+
+    vg = analyzed["Vg"].to_numpy(dtype=float)
+    current = np.abs(analyzed[current_column].to_numpy(dtype=float))
+    valid = np.isfinite(vg) & np.isfinite(current) & (current > 0)
+    vg = vg[valid]
+    current = current[valid]
+
+    if len(vg) < 2:
+        return np.nan
+
+    order = np.argsort(vg)
+    vg = vg[order]
+    current = current[order]
+
+    if target_vg < np.nanmin(vg) or target_vg > np.nanmax(vg):
+        return np.nan
+
+    log_i = np.log10(current)
+    log_target_i = np.interp(float(target_vg), vg, log_i)
+    return float(10 ** log_target_i)
+
+
+def find_vg_at_current(
+    analyzed: pd.DataFrame,
+    target_current: float,
+    preferred_vg: float | None = None,
+    current_column: str = "Id_smooth",
+) -> float:
+    """주어진 |Id|와 같은 전류가 흐르는 Vg를 log-current 공간에서 찾습니다."""
+    if (
+        not np.isfinite(target_current)
+        or target_current <= 0
+        or current_column not in analyzed.columns
+    ):
+        return np.nan
+
+    vg = analyzed["Vg"].to_numpy(dtype=float)
+    current = np.abs(analyzed[current_column].to_numpy(dtype=float))
+    valid = np.isfinite(vg) & np.isfinite(current) & (current > 0)
+    vg = vg[valid]
+    current = current[valid]
+
+    if len(vg) < 2:
+        return np.nan
+
+    log_i = np.log10(current)
+    target = np.log10(float(target_current))
+    candidates = []
+
+    for i in range(len(vg) - 1):
+        x1, x2 = float(vg[i]), float(vg[i + 1])
+        y1, y2 = float(log_i[i]), float(log_i[i + 1])
+        d1, d2 = y1 - target, y2 - target
+
+        if np.isclose(d1, 0.0, atol=1e-12):
+            candidates.append(x1)
+        if np.isclose(d2, 0.0, atol=1e-12):
+            candidates.append(x2)
+
+        if d1 * d2 < 0:
+            if not np.isclose(y2, y1):
+                x_cross = x1 + (target - y1) * (x2 - x1) / (y2 - y1)
+            else:
+                x_cross = (x1 + x2) / 2.0
+            candidates.append(float(x_cross))
+
+    if not candidates:
+        return np.nan
+
+    cand = np.asarray(candidates, dtype=float)
+    cand = cand[np.isfinite(cand)]
+    if len(cand) == 0:
+        return np.nan
+
+    if preferred_vg is not None and np.isfinite(preferred_vg):
+        return float(cand[np.argmin(np.abs(cand - float(preferred_vg)))])
+
+    return float(cand[0])
+
+
 def add_mobility(
     result: dict,
     analyzed: pd.DataFrame,
@@ -459,8 +547,42 @@ def analyze_single_file(
             tox_nm=tox_nm,
             eps0=eps0,
         )
+
+        # Reverse gm_max는 gm 그래프의 진단용 peak 표시에만 유지합니다.
+        # Reverse mobility에는 사용하지 않도록 N/A 처리하고, mobility는 Forward 기준으로 해석합니다.
+        if label == "Reverse":
+            result["mu_FE_cm2_Vs"] = np.nan
+
         results[label] = result
         frames[label] = analyzed
+
+    # Primary Vth / Hysteresis
+    # Forward: 기존 gm-max tangent Vth
+    # Reverse: Forward Vth 위치에서의 |Id|와 동일한 전류가 흐르는 Vg
+    if "Forward" in results and "Reverse" in results:
+        f = results["Forward"]
+        r = results["Reverse"]
+
+        # Reverse의 기존 gm-max tangent Vth는 진단용으로 보관
+        r["Vth_GMMax_Diagnostic_V"] = r.get("Vth_V", np.nan)
+
+        match_current = interpolate_current_at_vg(
+            frames["Forward"],
+            f["Vth_V"],
+            current_column="Id_smooth",
+        )
+        matched_reverse_vth = find_vg_at_current(
+            frames["Reverse"],
+            match_current,
+            preferred_vg=f["Vth_V"],
+            current_column="Id_smooth",
+        )
+
+        f["Vth_Primary_Method"] = "Forward gm-max tangent"
+        r["Vth_Primary_Method"] = "Reverse same-|Id| as Forward Vth"
+        f["Vth_Match_Current_A"] = match_current
+        r["Vth_Match_Current_A"] = match_current
+        r["Vth_V"] = matched_reverse_vth
 
     return results, frames, df, header_row
 
@@ -549,6 +671,7 @@ def analyze_batch_file(
         "Vth F (V)": f["Vth_V"],
         "Vth R (V)": r["Vth_V"],
         "Vth Hysteresis |R-F| (V)": hysteresis,
+        "Vth match current (A)": f.get("Vth_Match_Current_A", np.nan),
         "Vth CC F (V)": f["Vth_CC_V"],
         "Vth CC R (V)": r["Vth_CC_V"],
         "Vth CC Hysteresis |R-F| (V)": hysteresis_cc,
@@ -603,7 +726,9 @@ def single_results_dataframe(results: dict) -> pd.DataFrame:
     for label, r in results.items():
         rows.append({
             "Sweep": label,
-            "Vth gm-max (V)": r["Vth_V"],
+            "Vth primary (V)": r["Vth_V"],
+            "Vth method": r.get("Vth_Primary_Method", "gm-max tangent"),
+            "Vth match current (A)": r.get("Vth_Match_Current_A", np.nan),
             "Vth constant-current (V)": r["Vth_CC_V"],
             "Iref (A)": r["Constant_Current_A"],
             "gm_max (S)": r["gm_max_S"],
@@ -629,11 +754,12 @@ def make_single_figures(results: dict, frames: dict, use_abs_id: bool):
         x0 = r["Vg_at_gmmax_V"]
         y0 = r["Id_at_gmmax_A"]
         gm = r["gm_max_S"]
-        xline = np.linspace(np.nanmin(data["Vg"]), np.nanmax(data["Vg"]), 200)
-        yline = y0 + gm * (xline - x0)
-        ax1.plot(xline, yline, linestyle="--", alpha=0.65, label=f"{label} gm-max tangent")
-        ax1.scatter([x0], [y0], s=35)
-        ax1.axvline(r["Vth_V"], linestyle=":", alpha=0.7)
+        if label == "Forward":
+            xline = np.linspace(np.nanmin(data["Vg"]), np.nanmax(data["Vg"]), 200)
+            yline = y0 + gm * (xline - x0)
+            ax1.plot(xline, yline, linestyle="--", alpha=0.65, label="Forward gm-max tangent")
+            ax1.scatter([x0], [y0], s=35, label="Forward gm_max")
+        ax1.axvline(r["Vth_V"], linestyle=":", alpha=0.7, label=f"{label} primary Vth")
     ax1.set_xlabel("Gate Voltage, Vg (V)")
     ax1.set_ylabel("|Drain Current|, |Id| (A)" if use_abs_id else "Drain Current, Id (A)")
     ax1.set_title("Transfer Curve - Linear Scale")
@@ -658,6 +784,19 @@ def make_single_figures(results: dict, frames: dict, use_abs_id: bool):
             linewidth=1.2,
             alpha=0.8,
             label=f"Constant current Iref={iref_plot:.1e} A",
+        )
+
+    match_current_plot = np.nan
+    if "Forward" in results:
+        match_current_plot = results["Forward"].get("Vth_Match_Current_A", np.nan)
+    if np.isfinite(match_current_plot) and match_current_plot > 0:
+        ax2.axhline(
+            match_current_plot,
+            color="black",
+            linestyle="--",
+            linewidth=1.1,
+            alpha=0.65,
+            label=f"F-Vth matched |Id|={match_current_plot:.1e} A",
         )
 
     for label, data in frames.items():
@@ -705,6 +844,20 @@ def make_single_figures(results: dict, frames: dict, use_abs_id: bool):
                 color=line_id.get_color(),
                 linewidths=1.8,
                 zorder=7,
+                label="_nolegend_",
+            )
+
+        primary_x = r.get("Vth_V", np.nan)
+        primary_i = r.get("Vth_Match_Current_A", np.nan)
+        if np.isfinite(primary_x) and np.isfinite(primary_i) and primary_i > 0:
+            ax2.scatter(
+                [primary_x], [primary_i],
+                s=48,
+                marker="D",
+                facecolors="none",
+                edgecolors=line_id.get_color(),
+                linewidths=1.4,
+                zorder=8,
                 label="_nolegend_",
             )
 
@@ -981,7 +1134,9 @@ def build_single_excel(
             "File": file_name,
             "Sheet": sheet_name,
             "Sweep": label,
-            "Vth gm-max (V)": r["Vth_V"],
+            "Vth primary (V)": r["Vth_V"],
+            "Vth primary method": r.get("Vth_Primary_Method", ""),
+            "Vth match current (A)": r.get("Vth_Match_Current_A", np.nan),
             "Vth constant-current (V)": r["Vth_CC_V"],
             "Constant current Iref (A)": r["Constant_Current_A"],
             "Mobility μFE (cm2/Vs)": r["mu_FE_cm2_Vs"],
@@ -1013,11 +1168,13 @@ def build_single_excel(
         for label, data in frames.items():
             export_df = data.copy()
             r = results[label]
-            export_df["Vth_gmmax_result_V"] = np.nan
+            export_df["Vth_primary_result_V"] = np.nan
+            export_df["Vth_match_current_A"] = np.nan
             export_df["Vth_constant_current_result_V"] = np.nan
             export_df["Constant_current_Iref_A"] = np.nan
             export_df["gm_max_result_S"] = np.nan
-            export_df.loc[0, "Vth_gmmax_result_V"] = r["Vth_V"]
+            export_df.loc[0, "Vth_primary_result_V"] = r["Vth_V"]
+            export_df.loc[0, "Vth_match_current_A"] = r.get("Vth_Match_Current_A", np.nan)
             export_df.loc[0, "Vth_constant_current_result_V"] = r["Vth_CC_V"]
             export_df.loc[0, "Constant_current_Iref_A"] = r["Constant_Current_A"]
             export_df.loc[0, "gm_max_result_S"] = r["gm_max_S"]
@@ -1080,7 +1237,7 @@ def statistics_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 VARIABILITY_METRICS = {
-    "Vth (gm-max)": {
+    "Vth (F gm-max / R same-current)": {
         "columns": ["Vth F (V)", "Vth R (V)"],
         "labels": ["Forward", "Reverse"],
         "ylabel": "Vth (V)",
@@ -1116,7 +1273,7 @@ VARIABILITY_METRICS = {
         "ylabel": "ON/OFF ratio",
         "log": True,
     },
-    "Vth Hysteresis (gm-max)": {
+    "Vth Hysteresis (F gm-max / R same-current)": {
         "columns": ["Vth Hysteresis |R-F| (V)"],
         "labels": ["Hysteresis"],
         "ylabel": "Vth Hysteresis (V)",
@@ -1217,8 +1374,8 @@ def format_statistics_for_display(stats_df: pd.DataFrame) -> pd.DataFrame:
 
 OUTLIER_METRICS = {
     "Vth F (gm-max)": "Vth F (V)",
-    "Vth R (gm-max)": "Vth R (V)",
-    "Vth Hysteresis (gm-max)": "Vth Hysteresis |R-F| (V)",
+    "Vth R (same-current)": "Vth R (V)",
+    "Vth Hysteresis (F gm-max / R same-current)": "Vth Hysteresis |R-F| (V)",
     "Vth CC F": "Vth CC F (V)",
     "Vth CC R": "Vth CC R (V)",
     "Vth CC Hysteresis": "Vth CC Hysteresis |R-F| (V)",
@@ -1430,7 +1587,7 @@ with tab_single:
             step=0.1,
             format="%.1f",
             key="single_reverse_gm_end",
-            help="Single 분석에서도 Reverse gm_max는 -10 V부터 이 값까지의 구간에서만 찾습니다. 예: 8.0 V이면 8~10 V 끝단 피크를 제외합니다.",
+            help="Reverse gm_max는 -10 V부터 이 값까지에서 찾으며, Reverse Vth/Hysteresis 계산에는 사용하지 않고 gm 그래프의 진단용 peak 표시에만 사용합니다.",
         )
     with c2:
         single_w = st.number_input("W (µm)", value=100.0, key="single_w")
@@ -1448,7 +1605,7 @@ with tab_single:
 
     st.caption(
         f"Single Reverse gm_max 탐색 범위: -10.0 V ~ {float(single_reverse_gm_end):.1f} V "
-        "(Forward gm_max는 기존처럼 전체 sweep 범위에서 탐색)"
+        "(Reverse gm_max는 진단용 표시이며, primary Reverse Vth/Hysteresis에는 사용하지 않음)"
     )
 
     if st.button("분석 실행", type="primary", key="single_run"):
@@ -1532,9 +1689,15 @@ with tab_single:
             r = results["Reverse"]
 
             m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Vth gm-max F", f"{f['Vth_V']:.4f} V")
-            m2.metric("Vth gm-max R", f"{r['Vth_V']:.4f} V")
-            m3.metric("gm-max Hysteresis |R-F|", f"{hys:.4f} V")
+            m1.metric("Vth F (gm-max)", f"{f['Vth_V']:.4f} V")
+            m2.metric(
+                "Vth R (same-current)",
+                f"{r['Vth_V']:.4f} V" if np.isfinite(r['Vth_V']) else "N/A",
+            )
+            m3.metric(
+                "Hysteresis |R-F| (same-current)",
+                f"{hys:.4f} V" if np.isfinite(hys) else "N/A",
+            )
             m4.metric("SS F", f"{f['SS_mV_dec']:.2f} mV/dec" if np.isfinite(f['SS_mV_dec']) else "N/A")
             m5.metric("μFE F", f"{f['mu_FE_cm2_Vs']:.3f} cm²/V·s" if np.isfinite(f['mu_FE_cm2_Vs']) else "N/A")
 
@@ -1562,6 +1725,7 @@ with tab_single:
 
         single_sci_cols = [
             "Iref (A)",
+            "Vth match current (A)",
             "gm_max (S)",
             "Id @ gm_max (A)",
             "ON/OFF",
@@ -1572,7 +1736,7 @@ with tab_single:
                 single_display_df[col] = single_display_df[col].apply(fmt_sci)
 
         single_fixed_formats = {
-            "Vth gm-max (V)": 4,
+            "Vth primary (V)": 4,
             "Vth constant-current (V)": 4,
             "SS (mV/dec)": 2,
             "μFE (cm²/V·s)": 3,
@@ -1677,7 +1841,7 @@ with tab_batch:
             step=0.1,
             format="%.1f",
             key="batch_reverse_gm_end",
-            help="Reverse gm_max는 -10 V부터 이 값까지의 구간에서만 찾습니다. 예: 8.0 V이면 8~10 V의 끝단 피크는 제외됩니다.",
+            help="Reverse gm_max는 -10 V부터 이 값까지에서 찾으며, Reverse Vth/Hysteresis 계산에는 사용하지 않고 gm 그래프의 진단용 peak 표시에만 사용합니다.",
         )
     with b2:
         batch_w = st.number_input("W (µm)", value=100.0, key="batch_w")
@@ -1909,7 +2073,7 @@ with tab_batch:
                     selected_outlier_labels = st.multiselect(
                         "이상치 판정에 사용할 특성값",
                         options=list(OUTLIER_METRICS.keys()),
-                        default=["Vth F (gm-max)", "Vth R (gm-max)"],
+                        default=["Vth F (gm-max)", "Vth R (same-current)"],
                         key="batch_outlier_metrics",
                     )
                     iqr_multiplier = st.number_input(
@@ -1992,6 +2156,7 @@ with tab_batch:
 
             numeric_cols = [
                 "Vth F (V)", "Vth R (V)", "Vth Hysteresis |R-F| (V)",
+                "Vth match current (A)",
                 "Vth CC F (V)", "Vth CC R (V)", "Vth CC Hysteresis |R-F| (V)",
                 "gm_max F (S)", "gm_max R (S)",
                 "SS F (mV/dec)", "SS R (mV/dec)",
@@ -2009,7 +2174,7 @@ with tab_batch:
 
             avg_table = pd.DataFrame([
                 {
-                    "특성값": "Vth (gm-max)",
+                    "특성값": "Vth (F gm-max / R same-current)",
                     "Forward 평균": f"{avg['Vth F (V)']:.4f}",
                     "Reverse 평균": f"{avg['Vth R (V)']:.4f}",
                     "Hysteresis |R-F|": f"{avg['Vth Hysteresis |R-F| (V)']:.4f}",
@@ -2054,6 +2219,7 @@ with tab_batch:
             display_cols = [
                 "Device", "사용 여부", "Sheet",
                 "Vth F (V)", "Vth R (V)", "Vth Hysteresis |R-F| (V)",
+                "Vth match current (A)",
                 "Vth CC F (V)", "Vth CC R (V)", "Vth CC Hysteresis |R-F| (V)",
                 "gm_max F (S)", "gm_max R (S)",
                 "SS F (mV/dec)", "SS R (mV/dec)",
@@ -2065,6 +2231,7 @@ with tab_batch:
             batch_display_df = result_df_with_status[display_cols].copy()
 
             batch_sci_cols = [
+                "Vth match current (A)",
                 "gm_max F (S)",
                 "gm_max R (S)",
                 "ON/OFF F",
@@ -2161,7 +2328,7 @@ with tab_batch:
             st.caption(
                 f"Batch gm 그래프는 Forward와 Reverse를 분리해서 표시합니다. "
                 f"Reverse gm_max는 -10.0 V ~ {float(batch_reverse_gm_end):.1f} V 범위에서만 탐색하며, "
-                "각 그래프의 마커가 선택된 gm_max 위치입니다."
+                "Reverse gm_max는 진단용 peak 표시에만 사용하며, primary Reverse Vth/Hysteresis에는 사용하지 않습니다. Reverse μFE는 계산하지 않습니다."
             )
 
             active_device_names = set(active_df["Device"].astype(str))
@@ -2248,7 +2415,7 @@ with tab_batch:
 
 st.divider()
 st.caption(
-    "Calculation: gm = dId/dVg · Vth(gm-max) = gm-max tangent method · "
+    "Calculation: gm = dId/dVg · Primary Vth: Forward=gm-max tangent, Reverse=same |Id| as Forward Vth · "
     "Vth(constant-current) = Vg at |Id| = Iref · "
     "SS = max positive slope of log10(|Id|)-Vg · "
     "μFE = (L/W)·gm_max/(Cox·Vd)"
