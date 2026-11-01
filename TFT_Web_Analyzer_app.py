@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import io
+import hashlib
+import colorsys
 import zipfile
 from pathlib import Path
 
@@ -10,18 +12,19 @@ import pandas as pd
 import streamlit as st
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
+from matplotlib.colors import to_rgb
 
 
 # ============================================================
 # Page
 # ============================================================
 st.set_page_config(
-    page_title="TFT Data Analyzer",
+    page_title="Transistor Analyzer",
     page_icon="📊",
     layout="wide",
 )
 
-st.title("TFT Data Analyzer")
+st.title("Transistor Analyzer")
 st.caption("Single / Batch TFT Transfer Characteristic Analysis")
 
 
@@ -179,8 +182,6 @@ def analyze_sweep(
     smoothing_window: int = 5,
     ss_window: int = 7,
     constant_current_A: float = 1e-6,
-    gm_search_vmin: float | None = None,
-    gm_search_vmax: float | None = None,
 ) -> tuple[dict, pd.DataFrame]:
     data = seg.copy()
 
@@ -225,20 +226,6 @@ def analyze_sweep(
         candidate = valid_indices
     if len(candidate) == 0:
         candidate = valid_indices
-
-    # gm_max 탐색 Vg 범위를 선택적으로 제한합니다.
-    # Reverse에서 예를 들어 -10 V ~ 8 V만 사용하면 10 V 부근 끝단 피크가 제외됩니다.
-    if gm_search_vmin is not None:
-        candidate = candidate[vg[candidate] >= float(gm_search_vmin)]
-    if gm_search_vmax is not None:
-        candidate = candidate[vg[candidate] <= float(gm_search_vmax)]
-
-    if len(candidate) == 0:
-        range_text = (
-            f"{gm_search_vmin if gm_search_vmin is not None else '-∞'} ~ "
-            f"{gm_search_vmax if gm_search_vmax is not None else '+∞'} V"
-        )
-        raise ValueError(f"gm_max 탐색 범위({range_text}) 안에 유효한 데이터가 없습니다.")
 
     idx = int(candidate[np.nanargmax(gm[candidate])])
     gm_max = float(gm[idx])
@@ -353,10 +340,41 @@ def analyze_sweep(
         "Smoothing_Window": win,
         "SS_Window": ss_window,
         "gm_index": idx,
-        "gm_Search_Vmin_V": gm_search_vmin if gm_search_vmin is not None else np.nan,
-        "gm_Search_Vmax_V": gm_search_vmax if gm_search_vmax is not None else np.nan,
     }
     return result, data
+
+
+def analyze_reverse_for_vth(
+    seg: pd.DataFrame,
+    smoothing_window: int = 5,
+    constant_current_A: float = 1e-6,
+) -> tuple[dict, pd.DataFrame]:
+    """Reverse: Id를 스무딩해 Vth 매칭만 준비. gm/SS/전류비/이동도는 계산하지 않습니다."""
+    data = seg.copy()
+    win = max(1, int(smoothing_window))
+    if win % 2 == 0:
+        win += 1
+    max_win = len(data) - (len(data) % 2 == 0)
+    win = min(win, max(1, max_win))
+    if win >= 3:
+        data["Id_smooth"] = (
+            data["Id_analysis"].rolling(window=win, center=True, min_periods=1).mean()
+        )
+    else:
+        data["Id_smooth"] = data["Id_analysis"]
+    vg = data["Vg"].to_numpy(dtype=float)
+    steps = np.abs(np.diff(vg))
+    steps = steps[np.isfinite(steps) & (steps > 0)]
+    iref = float(constant_current_A)
+    if not np.isfinite(iref) or iref <= 0:
+        raise ValueError("Constant current Iref는 0보다 커야 합니다.")
+    return {
+        "Vth_V": np.nan,
+        "Vth_CC_V": np.nan,
+        "Constant_Current_A": iref,
+        "Vg_Step_V": float(np.median(steps)) if len(steps) else np.nan,
+        "Smoothing_Window": win,
+    }, data
 
 
 def interpolate_current_at_vg(
@@ -492,8 +510,6 @@ def analyze_single_file(
     smoothing_window: int,
     ss_window: int,
     constant_current_A: float,
-    reverse_gm_search_start_v: float | None = None,
-    reverse_gm_search_end_v: float | None = None,
     use_abs_id: bool,
     W_um: float,
     L_um: float,
@@ -527,31 +543,24 @@ def analyze_single_file(
             vd_raw[sl] if vd_raw is not None else None,
             use_abs_id=use_abs_id,
         )
-        gm_vmin = reverse_gm_search_start_v if label == "Reverse" else None
-        gm_vmax = reverse_gm_search_end_v if label == "Reverse" else None
-
-        result, analyzed = analyze_sweep(
-            seg,
-            smoothing_window=smoothing_window,
-            ss_window=ss_window,
-            constant_current_A=constant_current_A,
-            gm_search_vmin=gm_vmin,
-            gm_search_vmax=gm_vmax,
-        )
-        result = add_mobility(
-            result,
-            analyzed,
-            W_um=W_um,
-            L_um=L_um,
-            eps_r=eps_r,
-            tox_nm=tox_nm,
-            eps0=eps0,
-        )
-
-        # Reverse gm_max는 gm 그래프의 진단용 peak 표시에만 유지합니다.
-        # Reverse mobility에는 사용하지 않도록 N/A 처리하고, mobility는 Forward 기준으로 해석합니다.
         if label == "Reverse":
-            result["mu_FE_cm2_Vs"] = np.nan
+            result, analyzed = analyze_reverse_for_vth(
+                seg,
+                smoothing_window=smoothing_window,
+                constant_current_A=constant_current_A,
+            )
+        else:
+            result, analyzed = analyze_sweep(
+                seg,
+                smoothing_window=smoothing_window,
+                ss_window=ss_window,
+                constant_current_A=constant_current_A,
+            )
+            result = add_mobility(
+                result, analyzed,
+                W_um=W_um, L_um=L_um,
+                eps_r=eps_r, tox_nm=tox_nm, eps0=eps0,
+            )
 
         results[label] = result
         frames[label] = analyzed
@@ -562,9 +571,6 @@ def analyze_single_file(
     if "Forward" in results and "Reverse" in results:
         f = results["Forward"]
         r = results["Reverse"]
-
-        # Reverse의 기존 gm-max tangent Vth는 진단용으로 보관
-        r["Vth_GMMax_Diagnostic_V"] = r.get("Vth_V", np.nan)
 
         match_current = interpolate_current_at_vg(
             frames["Forward"],
@@ -583,6 +589,12 @@ def analyze_single_file(
         f["Vth_Match_Current_A"] = match_current
         r["Vth_Match_Current_A"] = match_current
         r["Vth_V"] = matched_reverse_vth
+        # Reverse CC Vth는 gm/SS 계산 없이 원본 |Id|와 Iref의 교차점으로만 산출합니다.
+        # 복수 교차점이면 Forward CC Vth에 가장 가까운 지점을 선택합니다.
+        r["Vth_CC_V"] = find_vg_at_current(
+            frames["Reverse"], float(constant_current_A),
+            preferred_vg=f["Vth_CC_V"], current_column="Id_analysis",
+        )
 
     return results, frames, df, header_row
 
@@ -621,8 +633,6 @@ def analyze_batch_file(
     smoothing_window: int,
     ss_window: int,
     constant_current_A: float,
-    reverse_gm_search_start_v: float = -10.0,
-    reverse_gm_search_end_v: float | None = None,
     use_abs_id: bool,
     W_um: float,
     L_um: float,
@@ -640,8 +650,6 @@ def analyze_batch_file(
         smoothing_window=smoothing_window,
         ss_window=ss_window,
         constant_current_A=constant_current_A,
-        reverse_gm_search_start_v=reverse_gm_search_start_v,
-        reverse_gm_search_end_v=reverse_gm_search_end_v,
         use_abs_id=use_abs_id,
         W_um=W_um,
         L_um=L_um,
@@ -656,47 +664,30 @@ def analyze_batch_file(
     f = results["Forward"]
     r = results["Reverse"]
     hysteresis = abs(r["Vth_V"] - f["Vth_V"])
-    hysteresis_cc = (
-        abs(r["Vth_CC_V"] - f["Vth_CC_V"])
-        if np.isfinite(r["Vth_CC_V"]) and np.isfinite(f["Vth_CC_V"])
-        else np.nan
-    )
+    # CC 관련 결과는 소자별 결과표에 넣지 않습니다. (내부 계산은 기존 유지)
 
     path = Path(file_name)
     row = {
-        # 같은 파일명(d1.xls 등)이 여러 번 업로드되어도 서로 다른 소자로 유지
+        # 내부에서는 파일/시트 및 매칭 전류를 유지해 그래프와 평균 계산에 활용합니다.
         "Device": device_label if device_label else path.stem,
         "File": path.name,
         "Sheet": sheet_name,
         "Vth F (V)": f["Vth_V"],
         "Vth R (V)": r["Vth_V"],
-        "Vth Hysteresis |R-F| (V)": hysteresis,
+        "Vth Hys (V)": hysteresis,
         "Vth match current (A)": f.get("Vth_Match_Current_A", np.nan),
-        "Vth CC F (V)": f["Vth_CC_V"],
-        "Vth CC R (V)": r["Vth_CC_V"],
-        "Vth CC Hysteresis |R-F| (V)": hysteresis_cc,
-        "Constant Current Iref (A)": f["Constant_Current_A"],
-        "Reverse gm search start (V)": reverse_gm_search_start_v,
-        "Reverse gm search end (V)": reverse_gm_search_end_v if reverse_gm_search_end_v is not None else np.nan,
-        "gm_max F (S)": f["gm_max_S"],
-        "gm_max R (S)": r["gm_max_S"],
-        "SS F (mV/dec)": f["SS_mV_dec"],
-        "SS R (mV/dec)": r["SS_mV_dec"],
-        "muFE F (cm2/Vs)": f["mu_FE_cm2_Vs"],
-        "muFE R (cm2/Vs)": r["mu_FE_cm2_Vs"],
-        "ON/OFF F": f["On_Off"],
-        "ON/OFF R": r["On_Off"],
-        "Vg step (V)": float(np.nanmedian([f["Vg_Step_V"], r["Vg_Step_V"]])),
+        "gm_max (S)": f["gm_max_S"],
+        "SS (mV/dec)": f["SS_mV_dec"],
+        "muFE (cm2/Vs)": f["mu_FE_cm2_Vs"],
+        "ON/OFF": f["On_Off"],
+        "VDS (V)": f["Vd_used_V"],
         "Vg@gmmax F (V)": f["Vg_at_gmmax_V"],
-        "Vg@gmmax R (V)": r["Vg_at_gmmax_V"],
         "Id@gmmax F (A)": f["Id_at_gmmax_A"],
-        "Id@gmmax R (A)": r["Id_at_gmmax_A"],
-        "Vd used F (V)": f["Vd_used_V"],
-        "Vd used R (V)": r["Vd_used_V"],
         "Cox (F/cm2)": f["Cox_F_cm2"],
         "Header Row": header_row + 1,
         "Data Points": len(df),
     }
+
     return row, frames
 
 
@@ -721,177 +712,17 @@ def fmt_sci(value):
     return "N/A"
 
 
-def single_results_dataframe(results: dict) -> pd.DataFrame:
-    rows = []
-    for label, r in results.items():
-        rows.append({
-            "Sweep": label,
-            "Vth primary (V)": r["Vth_V"],
-            "Vth method": r.get("Vth_Primary_Method", "gm-max tangent"),
-            "Vth match current (A)": r.get("Vth_Match_Current_A", np.nan),
-            "Vth constant-current (V)": r["Vth_CC_V"],
-            "Iref (A)": r["Constant_Current_A"],
-            "gm_max (S)": r["gm_max_S"],
-            "SS (mV/dec)": r["SS_mV_dec"],
-            "μFE (cm²/V·s)": r["mu_FE_cm2_Vs"],
-            "Vg @ gm_max (V)": r["Vg_at_gmmax_V"],
-            "Id @ gm_max (A)": r["Id_at_gmmax_A"],
-            "ON/OFF": r["On_Off"],
-            "Vg step (V)": r["Vg_Step_V"],
-            "Vd used (V)": r["Vd_used_V"],
-            "Cox (F/cm²)": r["Cox_F_cm2"],
-        })
-    return pd.DataFrame(rows)
+def gate_current_color(drain_color):
+    """소자별 Id 색상에 대응하는, 확실히 구분되는 Ig 색상을 반환합니다."""
+    hue, saturation, value = colorsys.rgb_to_hsv(*to_rgb(drain_color))
+    return colorsys.hsv_to_rgb(
+        (hue + 0.5) % 1.0, max(0.60, saturation), max(0.65, value)
+    )
 
 
-def make_single_figures(results: dict, frames: dict, use_abs_id: bool):
+def make_batch_figures(curves: dict, figsize: tuple[float, float] = (8, 6)):
     # Linear
-    fig1 = Figure(figsize=(9, 5.2), dpi=110)
-    ax1 = fig1.add_subplot(111)
-    for label, data in frames.items():
-        r = results[label]
-        ax1.plot(data["Vg"], data["Id_analysis"], label=f"{label} |Id|")
-        x0 = r["Vg_at_gmmax_V"]
-        y0 = r["Id_at_gmmax_A"]
-        gm = r["gm_max_S"]
-        if label == "Forward":
-            xline = np.linspace(np.nanmin(data["Vg"]), np.nanmax(data["Vg"]), 200)
-            yline = y0 + gm * (xline - x0)
-            ax1.plot(xline, yline, linestyle="--", alpha=0.65, label="Forward gm-max tangent")
-            ax1.scatter([x0], [y0], s=35, label="Forward gm_max")
-        ax1.axvline(r["Vth_V"], linestyle=":", alpha=0.7, label=f"{label} primary Vth")
-    ax1.set_xlabel("Gate Voltage, Vg (V)")
-    ax1.set_ylabel("|Drain Current|, |Id| (A)" if use_abs_id else "Drain Current, Id (A)")
-    ax1.set_title("Transfer Curve - Linear Scale")
-    ax1.grid(True, alpha=0.25)
-    ax1.legend(fontsize=8)
-    fig1.tight_layout()
-
-    # Log Id + Ig
-    fig2 = Figure(figsize=(9, 5.2), dpi=110)
-    ax2 = fig2.add_subplot(111)
-
-    # Constant-current 기준선
-    iref_plot = np.nan
-    if results:
-        first_result = next(iter(results.values()))
-        iref_plot = first_result.get("Constant_Current_A", np.nan)
-    if np.isfinite(iref_plot) and iref_plot > 0:
-        ax2.axhline(
-            iref_plot,
-            color="gray",
-            linestyle=":",
-            linewidth=1.2,
-            alpha=0.8,
-            label=f"Constant current Iref={iref_plot:.1e} A",
-        )
-
-    match_current_plot = np.nan
-    if "Forward" in results:
-        match_current_plot = results["Forward"].get("Vth_Match_Current_A", np.nan)
-    if np.isfinite(match_current_plot) and match_current_plot > 0:
-        ax2.axhline(
-            match_current_plot,
-            color="black",
-            linestyle="--",
-            linewidth=1.1,
-            alpha=0.65,
-            label=f"F-Vth matched |Id|={match_current_plot:.1e} A",
-        )
-
-    for label, data in frames.items():
-        r = results[label]
-        y = np.abs(data["Id_raw"].to_numpy(dtype=float))
-        y[y <= 0] = np.nan
-
-        # Id curve 색상을 SS max-slope marker에도 그대로 사용
-        line_id, = ax2.semilogy(data["Vg"], y, label=f"{label} |Id|")
-
-        # Log 그래프에서는 gm_max가 아니라
-        # SS 계산에 사용된 가장 가파른 log10(Id)-Vg 구간의 중심점을 표시
-        ss_x = r.get("SS_Vg_center_V", np.nan)
-        if np.isfinite(ss_x):
-            vg_arr = data["Vg"].to_numpy(dtype=float)
-            finite_idx = np.where(
-                np.isfinite(vg_arr) & np.isfinite(y) & (y > 0)
-            )[0]
-
-            if len(finite_idx):
-                nearest_idx = finite_idx[
-                    np.argmin(np.abs(vg_arr[finite_idx] - ss_x))
-                ]
-                ss_y = float(y[nearest_idx])
-                ss_x_plot = float(vg_arr[nearest_idx])
-
-                ax2.scatter(
-                    [ss_x_plot], [ss_y],
-                    s=55,
-                    color=line_id.get_color(),
-                    edgecolors="black",
-                    linewidths=0.6,
-                    zorder=6,
-                    label="_nolegend_",
-                )
-
-        # Constant-current Vth 교차점: X marker
-        cc_x = r.get("Vth_CC_V", np.nan)
-        cc_i = r.get("Constant_Current_A", np.nan)
-        if np.isfinite(cc_x) and np.isfinite(cc_i) and cc_i > 0:
-            ax2.scatter(
-                [cc_x], [cc_i],
-                s=65,
-                marker="x",
-                color=line_id.get_color(),
-                linewidths=1.8,
-                zorder=7,
-                label="_nolegend_",
-            )
-
-        primary_x = r.get("Vth_V", np.nan)
-        primary_i = r.get("Vth_Match_Current_A", np.nan)
-        if np.isfinite(primary_x) and np.isfinite(primary_i) and primary_i > 0:
-            ax2.scatter(
-                [primary_x], [primary_i],
-                s=48,
-                marker="D",
-                facecolors="none",
-                edgecolors=line_id.get_color(),
-                linewidths=1.4,
-                zorder=8,
-                label="_nolegend_",
-            )
-
-        if "Ig_raw" in data.columns:
-            yig = np.abs(data["Ig_raw"].to_numpy(dtype=float))
-            yig[yig <= 0] = np.nan
-            ax2.semilogy(data["Vg"], yig, linestyle="--", alpha=0.7, label=f"{label} |Ig|")
-    ax2.set_xlabel("Gate Voltage, Vg (V)")
-    ax2.set_ylabel("Current (A)")
-    ax2.set_title("Transfer Curve - Log Scale")
-    ax2.grid(True, which="both", alpha=0.25)
-    ax2.legend(fontsize=8)
-    fig2.tight_layout()
-
-    # gm
-    fig3 = Figure(figsize=(9, 5.2), dpi=110)
-    ax3 = fig3.add_subplot(111)
-    for label, data in frames.items():
-        r = results[label]
-        ax3.plot(data["Vg"], data["gm"], label=label)
-        ax3.scatter([r["Vg_at_gmmax_V"]], [r["gm_max_S"]], s=40, label=f"{label} gm_max")
-    ax3.set_xlabel("Gate Voltage, Vg (V)")
-    ax3.set_ylabel("Transconductance, gm (S)")
-    ax3.set_title("gm - Vg")
-    ax3.grid(True, alpha=0.25)
-    ax3.legend(fontsize=8)
-    fig3.tight_layout()
-
-    return fig1, fig2, fig3
-
-
-def make_batch_figures(curves: dict):
-    # Linear
-    fig1 = Figure(figsize=(12, 6), dpi=100)
+    fig1 = Figure(figsize=figsize, dpi=100)
     ax1 = fig1.add_subplot(111)
     for item in curves.values():
         device = item["Device"]
@@ -910,10 +741,11 @@ def make_batch_figures(curves: dict):
     fig1.tight_layout()
 
     # Log Id + Ig
-    fig2 = Figure(figsize=(12, 6), dpi=100)
+    fig2 = Figure(figsize=figsize, dpi=100)
     ax2 = fig2.add_subplot(111)
     device_handles = []
     any_ig = False
+    any_vth_match = False
 
     for item in curves.values():
         device = item["Device"]
@@ -934,9 +766,38 @@ def make_batch_figures(curves: dict):
             ig_r = np.abs(r["Ig_raw"].to_numpy(dtype=float))
             ig_f[ig_f <= 0] = np.nan
             ig_r[ig_r <= 0] = np.nan
-            ax2.semilogy(f["Vg"], ig_f, linestyle=":", linewidth=1.35, color=color, alpha=0.9, label="_nolegend_")
-            ax2.semilogy(r["Vg"], ig_r, linestyle="-.", linewidth=1.35, color=color, alpha=0.9, label="_nolegend_")
+            ig_color = gate_current_color(color)
+            # Drain / Gate는 서로 다른 색, Forward는 실선, Reverse는 점선.
+            ax2.semilogy(f["Vg"], ig_f, linestyle="-", linewidth=1.7,
+                         color=ig_color, alpha=0.95, label="_nolegend_")
+            ax2.semilogy(r["Vg"], ig_r, linestyle="--", linewidth=1.5,
+                         color=ig_color, alpha=0.95, label="_nolegend_")
             any_ig = True
+
+        # Primary Vth 두 점은 *동일한 |Id|*에서 구했습니다.
+        # F: gm-max tangent Vth, R: F Vth의 스무딩 전류와 일치하는 Vg.
+        # 곡선은 기존 Batch 방식(원본 |Id|)을 유지하지만, 두 표시점은
+        # 분석에 쓰인 스무딩 |Id| 기반 값이므로 곡선과 미세한 차이가 날 수 있습니다.
+        vth_f = float(item.get("Vth_F", np.nan))
+        vth_r = float(item.get("Vth_R", np.nan))
+        match_i = float(item.get("Vth_match_current", np.nan))
+        if np.isfinite(vth_f) and np.isfinite(vth_r) and np.isfinite(match_i) and match_i > 0:
+            any_vth_match = True
+            ax2.plot(
+                [vth_f, vth_r], [match_i, match_i],
+                color=color, linestyle=(0, (2, 3)), linewidth=1.7,
+                alpha=0.95, zorder=6, label="_nolegend_",
+            )
+            ax2.scatter(
+                [vth_f], [match_i], marker="o", s=85,
+                facecolors="white", edgecolors=color, linewidths=2,
+                zorder=8, label="_nolegend_",
+            )
+            ax2.scatter(
+                [vth_r], [match_i], marker="D", s=67,
+                facecolors=color, edgecolors="black", linewidths=0.8,
+                zorder=9, label="_nolegend_",
+            )
 
         device_handles.append(Line2D([0], [0], color=color, linewidth=1.8, linestyle="-", label=device))
 
@@ -961,14 +822,23 @@ def make_batch_figures(curves: dict):
     ]
     if any_ig:
         style_handles.extend([
-            Line2D([0], [0], color="black", linestyle=":", linewidth=1.35, label="Ig Forward"),
-            Line2D([0], [0], color="black", linestyle="-.", linewidth=1.35, label="Ig Reverse"),
+            Line2D([0], [0], color="black", linestyle="-", linewidth=1.7, label="Ig Forward"),
+            Line2D([0], [0], color="black", linestyle="--", linewidth=1.5, label="Ig Reverse"),
         ])
-    ax2.legend(handles=style_handles, title="Current / Sweep", fontsize=8, loc="lower right")
+    if any_vth_match:
+        style_handles.extend([
+            Line2D([0], [0], color="black", marker="o", markersize=7,
+                   markerfacecolor="white", linestyle="None", label="Vth F (gm-max)"),
+            Line2D([0], [0], color="black", marker="D", markersize=6,
+                   linestyle="None", label="Vth R (same-current)"),
+            Line2D([0], [0], color="black", linestyle=(0, (2, 3)),
+                   linewidth=1.5, label="Same-current Vth link"),
+        ])
+    ax2.legend(handles=style_handles, title="Current / Sweep / Vth", fontsize=8, loc="lower right")
     fig2.tight_layout()
 
     # gm - Forward only
-    fig3 = Figure(figsize=(12, 6), dpi=100)
+    fig3 = Figure(figsize=figsize, dpi=100)
     ax3 = fig3.add_subplot(111)
     gm_f_handles = []
 
@@ -1024,71 +894,15 @@ def make_batch_figures(curves: dict):
     )
     fig3.tight_layout()
 
-    # gm - Reverse only
-    fig4 = Figure(figsize=(12, 6), dpi=100)
-    ax4 = fig4.add_subplot(111)
-    gm_r_handles = []
-
-    for item in curves.values():
-        device = item["Device"]
-        r = item["Reverse"]
-
-        line_r, = ax4.plot(
-            r["Vg"], r["gm"], linestyle="--", linewidth=1.5, label=device
-        )
-        device_color = line_r.get_color()
-
-        x_r = item.get("Vg_gmmax_R", np.nan)
-        y_r = item.get("gmmax_R", np.nan)
-        if np.isfinite(x_r) and np.isfinite(y_r):
-            ax4.scatter(
-                [x_r], [y_r],
-                s=56, marker="s",
-                color=device_color,
-                edgecolors="black", linewidths=0.6,
-                zorder=6, label="_nolegend_",
-            )
-
-        gm_r_handles.append(
-            Line2D([0], [0], color=device_color, linewidth=1.8, linestyle="--", label=device)
-        )
-
-    ax4.set_xlabel("Gate Voltage, Vg (V)")
-    ax4.set_ylabel("Transconductance, gm (S)")
-    ax4.set_title("All Devices - Reverse gm-Vg")
-    ax4.grid(True, alpha=0.25)
-
-    if gm_r_handles:
-        dev_leg_r = ax4.legend(
-            handles=gm_r_handles,
-            title="Device",
-            fontsize=8,
-            ncol=max(1, min(5, len(gm_r_handles))),
-            loc="upper left",
-        )
-        ax4.add_artist(dev_leg_r)
-
-    ax4.legend(
-        handles=[
-            Line2D(
-                [0], [0], color="black", linestyle="--", linewidth=1.5,
-                marker="s", markersize=6, markeredgecolor="black",
-                label="gm_max",
-            )
-        ],
-        fontsize=8,
-        loc="lower right",
-    )
-    fig4.tight_layout()
-
-    return fig1, fig2, fig3, fig4
+    return fig1, fig2, fig3
 
 
 
 def figure_to_png_bytes(fig: Figure, dpi: int = 300) -> bytes:
     """Matplotlib Figure를 고해상도 PNG bytes로 변환합니다."""
     output = io.BytesIO()
-    fig.savefig(output, format="png", dpi=dpi, bbox_inches="tight")
+    # 여백을 잘라 비율이 바뀌지 않도록 저장 시 원본 캔버스를 유지합니다.
+    fig.savefig(output, format="png", dpi=dpi)
     output.seek(0)
     return output.getvalue()
 
@@ -1108,100 +922,14 @@ def build_figures_zip(figures, file_names: list[str], dpi: int = 300) -> bytes:
     return output.getvalue()
 
 
-def build_single_excel(
-    file_name: str,
-    sheet_name: str,
-    results: dict,
-    frames: dict,
-    raw_df: pd.DataFrame,
-    *,
-    W_um: float,
-    L_um: float,
-    eps_r: float,
-    tox_nm: float,
-    use_abs_id: bool,
-) -> bytes:
-    output = io.BytesIO()
-
-    if "Forward" in results and "Reverse" in results:
-        hys = abs(results["Reverse"]["Vth_V"] - results["Forward"]["Vth_V"])
-    else:
-        hys = np.nan
-
-    summary_rows = []
-    for label, r in results.items():
-        summary_rows.append({
-            "File": file_name,
-            "Sheet": sheet_name,
-            "Sweep": label,
-            "Vth primary (V)": r["Vth_V"],
-            "Vth primary method": r.get("Vth_Primary_Method", ""),
-            "Vth match current (A)": r.get("Vth_Match_Current_A", np.nan),
-            "Vth constant-current (V)": r["Vth_CC_V"],
-            "Constant current Iref (A)": r["Constant_Current_A"],
-            "Mobility μFE (cm2/Vs)": r["mu_FE_cm2_Vs"],
-            "Cox (F/cm2)": r["Cox_F_cm2"],
-            "Vg step (V)": r["Vg_Step_V"],
-            "Vd used (V)": r["Vd_used_V"],
-            "W (um)": W_um,
-            "L (um)": L_um,
-            "eps_r": eps_r,
-            "tox (nm)": tox_nm,
-            "Vth Hysteresis |R-F| (V)": hys,
-            "gm_max (S)": r["gm_max_S"],
-            "Vg @ gm_max (V)": r["Vg_at_gmmax_V"],
-            "Id @ gm_max (A)": r["Id_at_gmmax_A"],
-            "SS (V/dec)": r["SS_V_dec"],
-            "SS (mV/dec)": r["SS_mV_dec"],
-            "SS center Vg (V)": r["SS_Vg_center_V"],
-            "Ion (A)": r["Ion_A"],
-            "Ioff (A)": r["Ioff_A"],
-            "ON/OFF": r["On_Off"],
-            "Smoothing Window": r["Smoothing_Window"],
-            "SS Window": r["SS_Window"],
-            "Use |Id|": use_abs_id,
-        })
-
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Summary", index=False)
-        raw_df.to_excel(writer, sheet_name="Raw_Read", index=False)
-        for label, data in frames.items():
-            export_df = data.copy()
-            r = results[label]
-            export_df["Vth_primary_result_V"] = np.nan
-            export_df["Vth_match_current_A"] = np.nan
-            export_df["Vth_constant_current_result_V"] = np.nan
-            export_df["Constant_current_Iref_A"] = np.nan
-            export_df["gm_max_result_S"] = np.nan
-            export_df.loc[0, "Vth_primary_result_V"] = r["Vth_V"]
-            export_df.loc[0, "Vth_match_current_A"] = r.get("Vth_Match_Current_A", np.nan)
-            export_df.loc[0, "Vth_constant_current_result_V"] = r["Vth_CC_V"]
-            export_df.loc[0, "Constant_current_Iref_A"] = r["Constant_Current_A"]
-            export_df.loc[0, "gm_max_result_S"] = r["gm_max_S"]
-            export_df.to_excel(writer, sheet_name=f"{label}_Calc"[:31], index=False)
-
-    return output.getvalue()
-
-
 def statistics_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Batch 특성값의 평균/표준편차/분산/CV/범위를 계산합니다."""
+    """Batch 특성값 통계; 표시하지 않는 매칭 전류도 평균과 분산에 사용합니다."""
     metrics = [
-        "Vth F (V)",
-        "Vth R (V)",
-        "Vth Hysteresis |R-F| (V)",
-        "Vth CC F (V)",
-        "Vth CC R (V)",
-        "Vth CC Hysteresis |R-F| (V)",
-        "gm_max F (S)",
-        "gm_max R (S)",
-        "SS F (mV/dec)",
-        "SS R (mV/dec)",
-        "muFE F (cm2/Vs)",
-        "muFE R (cm2/Vs)",
-        "ON/OFF F",
-        "ON/OFF R",
-        "Vg step (V)",
+        "Vth F (V)", "Vth R (V)", "Vth Hys (V)",
+        "Vth match current (A)", "VDS (V)",
+        "gm_max (S)", "SS (mV/dec)", "muFE (cm2/Vs)", "ON/OFF",
     ]
+
     rows = []
     for metric in metrics:
         if metric not in df.columns:
@@ -1243,58 +971,59 @@ VARIABILITY_METRICS = {
         "ylabel": "Vth (V)",
         "log": False,
     },
-    "Vth (constant-current)": {
-        "columns": ["Vth CC F (V)", "Vth CC R (V)"],
-        "labels": ["Forward", "Reverse"],
-        "ylabel": "Vth CC (V)",
-        "log": False,
-    },
     "SS": {
-        "columns": ["SS F (mV/dec)", "SS R (mV/dec)"],
-        "labels": ["Forward", "Reverse"],
+        "columns": ["SS (mV/dec)"],
+        "labels": ["Forward"],
         "ylabel": "SS (mV/dec)",
         "log": False,
     },
     "Mobility μFE": {
-        "columns": ["muFE F (cm2/Vs)", "muFE R (cm2/Vs)"],
-        "labels": ["Forward", "Reverse"],
+        "columns": ["muFE (cm2/Vs)"],
+        "labels": ["Forward"],
         "ylabel": "μFE (cm²/V·s)",
         "log": False,
     },
     "gm_max": {
-        "columns": ["gm_max F (S)", "gm_max R (S)"],
-        "labels": ["Forward", "Reverse"],
+        "columns": ["gm_max (S)"],
+        "labels": ["Forward"],
         "ylabel": "gm_max (S)",
         "log": False,
     },
     "ON/OFF ratio": {
-        "columns": ["ON/OFF F", "ON/OFF R"],
-        "labels": ["Forward", "Reverse"],
+        "columns": ["ON/OFF"],
+        "labels": ["Forward"],
         "ylabel": "ON/OFF ratio",
         "log": True,
     },
     "Vth Hysteresis (F gm-max / R same-current)": {
-        "columns": ["Vth Hysteresis |R-F| (V)"],
+        "columns": ["Vth Hys (V)"],
         "labels": ["Hysteresis"],
         "ylabel": "Vth Hysteresis (V)",
         "log": False,
     },
-    "Vth Hysteresis (constant-current)": {
-        "columns": ["Vth CC Hysteresis |R-F| (V)"],
-        "labels": ["Hysteresis"],
-        "ylabel": "Vth CC Hysteresis (V)",
+    "Vth match current": {
+        "columns": ["Vth match current (A)"],
+        "labels": ["Match current"],
+        "ylabel": "Match current (A)",
+        "log": True,
+    },
+    "VDS": {
+        "columns": ["VDS (V)"],
+        "labels": ["VDS"],
+        "ylabel": "VDS (V)",
         "log": False,
     },
 }
 
-
-def make_variability_figure(df: pd.DataFrame, metric_name: str) -> Figure:
+def make_variability_figure(
+    df: pd.DataFrame, metric_name: str, figsize: tuple[float, float] = (8, 6)
+) -> Figure:
     """소자별 특성값과 평균 ± 1σ 범위를 함께 표시합니다."""
     info = VARIABILITY_METRICS[metric_name]
     columns = info["columns"]
     labels = info["labels"]
 
-    fig = Figure(figsize=(10, 5.2), dpi=110)
+    fig = Figure(figsize=figsize, dpi=110)
     ax = fig.add_subplot(111)
 
     x = np.arange(len(df), dtype=float)
@@ -1375,20 +1104,14 @@ def format_statistics_for_display(stats_df: pd.DataFrame) -> pd.DataFrame:
 OUTLIER_METRICS = {
     "Vth F (gm-max)": "Vth F (V)",
     "Vth R (same-current)": "Vth R (V)",
-    "Vth Hysteresis (F gm-max / R same-current)": "Vth Hysteresis |R-F| (V)",
-    "Vth CC F": "Vth CC F (V)",
-    "Vth CC R": "Vth CC R (V)",
-    "Vth CC Hysteresis": "Vth CC Hysteresis |R-F| (V)",
-    "gm_max F": "gm_max F (S)",
-    "gm_max R": "gm_max R (S)",
-    "SS F": "SS F (mV/dec)",
-    "SS R": "SS R (mV/dec)",
-    "μFE F": "muFE F (cm2/Vs)",
-    "μFE R": "muFE R (cm2/Vs)",
-    "ON/OFF F": "ON/OFF F",
-    "ON/OFF R": "ON/OFF R",
+    "Vth Hysteresis (F gm-max / R same-current)": "Vth Hys (V)",
+    "gm_max": "gm_max (S)",
+    "SS": "SS (mV/dec)",
+    "μFE": "muFE (cm2/Vs)",
+    "ON/OFF": "ON/OFF",
+    "Vth match current": "Vth match current (A)",
+    "VDS": "VDS (V)",
 }
-
 
 def detect_iqr_outliers(
     df: pd.DataFrame,
@@ -1456,8 +1179,6 @@ def build_batch_excel(
     smoothing: int,
     ss_window: int,
     constant_current_A: float,
-    reverse_gm_search_start_v: float,
-    reverse_gm_search_end_v: float,
     col_vg: str,
     col_id: str,
     col_ig: str,
@@ -1470,7 +1191,7 @@ def build_batch_excel(
     if outlier_df is None:
         outlier_df = pd.DataFrame()
 
-    average_row = {"Device": "AVERAGE", "File": "", "Sheet": f"N={len(result_df)}"}
+    average_row = {"Device": "AVERAGE", "File": ""}
     for col in result_df.columns:
         if col in ["Device", "File", "Sheet"]:
             continue
@@ -1480,6 +1201,13 @@ def build_batch_excel(
             average_row[col] = float(numeric.mean())
 
     summary_df = pd.concat([result_df, pd.DataFrame([average_row])], ignore_index=True)
+    # Sheet/매칭 전류는 개별 결과표에서 제거하고, 평균은 별도 Averages 시트에 표시합니다.
+    visible_excel_cols = [
+        "Device", "File", "Vth F (V)", "Vth R (V)", "Vth Hys (V)",
+        "gm_max (S)", "SS (mV/dec)", "muFE (cm2/Vs)", "ON/OFF",
+    ]
+    summary_df = summary_df[visible_excel_cols]
+    averages_df = make_batch_style_summary(result_df)
     stats_df = statistics_dataframe(result_df)
     Cox = eps0 * eps_r / (tox_nm * 1e-7)
 
@@ -1493,8 +1221,6 @@ def build_batch_excel(
         {"Parameter": "Smoothing window", "Value": smoothing, "Unit": "points"},
         {"Parameter": "SS window", "Value": ss_window, "Unit": "points"},
         {"Parameter": "Constant current Iref", "Value": constant_current_A, "Unit": "A"},
-        {"Parameter": "Reverse gm search start", "Value": reverse_gm_search_start_v, "Unit": "V"},
-        {"Parameter": "Reverse gm search end", "Value": reverse_gm_search_end_v, "Unit": "V"},
         {"Parameter": "Vg column", "Value": col_vg, "Unit": ""},
         {"Parameter": "Id column", "Value": col_id, "Unit": ""},
         {"Parameter": "Ig column", "Value": col_ig, "Unit": ""},
@@ -1504,10 +1230,13 @@ def build_batch_excel(
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         # Summary/Statistics는 이상치 제외가 적용된 데이터 기준
         summary_df.to_excel(writer, sheet_name="Summary", index=False)
+        averages_df.to_excel(writer, sheet_name="Averages", index=False)
         stats_df.to_excel(writer, sheet_name="Statistics", index=False)
 
         # 원본 Batch 계산 결과는 항상 별도 보존
-        all_result_df.to_excel(writer, sheet_name="All_Results", index=False)
+        all_result_df.drop(columns=["Sheet", "Vth match current (A)"], errors="ignore").to_excel(
+            writer, sheet_name="All_Results", index=False
+        )
 
         if not outlier_df.empty:
             outlier_df.to_excel(writer, sheet_name="Outliers", index=False)
@@ -1529,11 +1258,83 @@ def build_batch_excel(
     return output.getvalue()
 
 
+def make_batch_style_summary(result_df: pd.DataFrame) -> pd.DataFrame:
+    """Single/Batch 공통 평균표: Match current와 VDS는 평균에서만 표시합니다."""
+    numeric_cols = [
+        "Vth F (V)", "Vth R (V)", "Vth Hys (V)",
+        "Vth match current (A)", "VDS (V)",
+        "SS (mV/dec)", "muFE (cm2/Vs)", "ON/OFF",
+    ]
+    avg = result_df[numeric_cols].apply(pd.to_numeric, errors="coerce").mean()
+
+    def mean_row(name, value, unit, decimals=3, scientific=False):
+        rendered = fmt_sci(value) if scientific else fmt_num(value, decimals)
+        return {
+            "특성값": name,
+            "Forward 평균": rendered,
+            "Reverse 평균": "—",
+            "Hysteresis |R-F|": "—",
+            "단위": unit,
+        }
+
+    return pd.DataFrame([
+        {
+            "특성값": "Vth (F gm-max / R same-current)",
+            "Forward 평균": fmt_num(avg["Vth F (V)"], 4),
+            "Reverse 평균": fmt_num(avg["Vth R (V)"], 4),
+            "Hysteresis |R-F|": fmt_num(avg["Vth Hys (V)"], 4),
+            "단위": "V",
+        },
+        mean_row("Vth match current", avg["Vth match current (A)"], "A", scientific=True),
+        mean_row("VDS", avg["VDS (V)"], "V", decimals=3),
+        mean_row("SS", avg["SS (mV/dec)"], "mV/dec", decimals=2),
+        mean_row("μFE", avg["muFE (cm2/Vs)"], "cm²/V·s", decimals=3),
+        mean_row("ON/OFF", avg["ON/OFF"], "-", scientific=True),
+    ])
+
+
+def format_batch_style_results(result_df_with_status: pd.DataFrame) -> pd.DataFrame:
+    """Single/Batch 공통 결과표: 요청한 9개 열만 표시합니다."""
+    display_cols = [
+        "Device", "사용 여부", "Vth F (V)", "Vth R (V)",
+        "Vth Hys (V)", "gm_max (S)", "SS (mV/dec)",
+        "muFE (cm2/Vs)", "ON/OFF",
+    ]
+    display_df = result_df_with_status[display_cols].copy()
+    for col in ("gm_max (S)", "ON/OFF"):
+        display_df[col] = display_df[col].apply(fmt_sci)
+
+    fixed_formats = {
+        "Vth F (V)": 4,
+        "Vth R (V)": 4,
+        "Vth Hys (V)": 4,
+        "SS (mV/dec)": 2,
+        "muFE (cm2/Vs)": 3,
+    }
+    for col, decimals in fixed_formats.items():
+        display_df[col] = display_df[col].apply(lambda x, d=decimals: fmt_num(x, d))
+    return display_df
+
+def overlay_curve_record(row: dict, frames: dict) -> dict:
+    """Batch/Single 공통 플롯 자료: Vth 매칭 점도 동일 방식으로 전달."""
+    return {
+        "Device": row["Device"],
+        "Forward": frames["Forward"],
+        "Reverse": frames["Reverse"],
+        "Vg_gmmax_F": row["Vg@gmmax F (V)"],
+        "gmmax_F": row["gm_max (S)"],
+        "Vth_F": row["Vth F (V)"],
+        "Vth_R": row["Vth R (V)"],
+        "Vth_match_current": row["Vth match current (A)"],
+    }
+
+
 # ============================================================
 # Session state
 # ============================================================
 for key, default in {
     "single_payload": None,
+    "single_uploader_version": 0,
     "batch_payload": None,
     "batch_uploader_version": 0,
 }.items():
@@ -1541,135 +1342,185 @@ for key, default in {
         st.session_state[key] = default
 
 
+# 버전 변경 뒤 기존 Streamlit 세션의 구 결과표/그림 캐시 사용 방지
+ANALYSIS_SCHEMA_VERSION = 3
+for payload_key in ("single_payload", "batch_payload"):
+    payload = st.session_state[payload_key]
+    if payload is not None and payload.get("schema_version") != ANALYSIS_SCHEMA_VERSION:
+        st.session_state[payload_key] = None
+
+
 # ============================================================
 # UI
 # ============================================================
+# 화면 표시 및 다운로드 PNG에 동일하게 적용되는 그래프 가로:세로 비율
+# 입력 비율을 유지한 채 종이 면적을 48 in² 부근으로 맞춥니다.
+# 기본 4:3에서는 기존과 같은 8 × 6 inch 그래프가 생성됩니다.
+def graph_figsize_from_ratio(width_ratio: float, height_ratio: float) -> tuple[float, float]:
+    if not (np.isfinite(width_ratio) and np.isfinite(height_ratio)):
+        raise ValueError("그래프 비율은 유효한 숫자여야 합니다.")
+    if width_ratio <= 0 or height_ratio <= 0:
+        raise ValueError("그래프 가로와 세로 비율은 모두 0보다 커야 합니다.")
+
+    ratio = float(width_ratio) / float(height_ratio)
+    fig_width = float(np.sqrt(48.0 * ratio))
+    fig_height = float(np.sqrt(48.0 / ratio))
+    # 아주 극단적인 비율을 입력해도 PNG 크기가 지나치게 커지지 않게 제한합니다.
+    scale = min(1.0, 12.0 / max(fig_width, fig_height))
+    return fig_width * scale, fig_height * scale
+
+
+st.markdown("**그래프 가로 : 세로 비율 (Single / Batch 공통)**")
+ratio_width_col, ratio_height_col = st.columns(2)
+with ratio_width_col:
+    graph_ratio_width = st.number_input(
+        "가로 비율",
+        min_value=1,
+        max_value=100,
+        value=4,
+        step=1,
+        key="graph_ratio_width",
+        help="예: 16:9 비율을 원하면 가로에 16을 입력하세요.",
+    )
+with ratio_height_col:
+    graph_ratio_height = st.number_input(
+        "세로 비율",
+        min_value=1,
+        max_value=100,
+        value=3,
+        step=1,
+        key="graph_ratio_height",
+        help="예: 16:9 비율을 원하면 세로에 9를 입력하세요.",
+    )
+
+graph_figsize = graph_figsize_from_ratio(graph_ratio_width, graph_ratio_height)
+st.caption(
+    f"현재 그래프 비율: {graph_ratio_width}:{graph_ratio_height} "
+    "| 기본값 4:3 | 숫자를 바꾸면 화면 그래프와 다운로드 PNG에 함께 반영됩니다."
+)
+
 tab_single, tab_batch = st.tabs(["Single Analyzer", "Batch Analyzer"])
 
 
 # ------------------------- Single ----------------------------
 with tab_single:
-    st.subheader("Single TFT Analyzer")
+    st.subheader("Single Transistor Analyzer")
 
-    single_file = st.file_uploader(
-        "TFT 측정 Excel 파일 업로드",
-        type=["xls", "xlsx"],
-        key="single_file",
-    )
+    upload_col, clear_col = st.columns([5, 1])
+    with upload_col:
+        single_file = st.file_uploader(
+            "TFT 측정 Excel 파일 1개 업로드",
+            type=["xls", "xlsx"],
+            accept_multiple_files=False,
+            key=f"single_file_{st.session_state.single_uploader_version}",
+        )
+    with clear_col:
+        st.write("")
+        st.write("")
+        if st.button("파일 삭제", key="single_clear_all_files", use_container_width=True):
+            st.session_state.single_uploader_version += 1
+            st.session_state.single_payload = None
+            st.session_state.pop("single_variation_metric", None)
+            st.rerun()
 
-    if single_file is not None:
-        file_bytes = single_file.getvalue()
-        try:
-            sheets = get_sheet_names(file_bytes)
-        except Exception as e:
-            st.error(f"Excel 파일을 읽을 수 없습니다: {e}")
-            sheets = []
-    else:
-        sheets = []
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        single_sheet = st.selectbox("Sheet", sheets, index=0 if sheets else None, placeholder="파일을 먼저 업로드하세요")
+    # 배치와 동일한 설정값 배치/순서 및 기본값.
+    s1, s2, s3, s4 = st.columns(4)
+    with s1:
+        single_smooth = st.number_input("Smoothing", min_value=1, max_value=31, value=5, step=2, key="single_smooth")
         single_ss = st.number_input("SS window", min_value=3, max_value=31, value=7, step=2, key="single_ss")
-        single_smooth = st.number_input("Smoothing window", min_value=1, max_value=31, value=5, step=2, key="single_smooth")
         single_iref = st.number_input(
-            "Constant current Iref (A)",
-            min_value=1e-15,
-            value=1e-6,
-            format="%.1e",
-            key="single_iref",
+            "Constant current Iref (A)", min_value=1e-15, value=1e-6,
+            format="%.1e", key="single_iref",
         )
-        single_reverse_gm_end = st.number_input(
-            "Reverse gm_max 탐색 끝 Vg (V)",
-            min_value=-10.0,
-            max_value=10.0,
-            value=8.0,
-            step=0.1,
-            format="%.1f",
-            key="single_reverse_gm_end",
-            help="Reverse gm_max는 -10 V부터 이 값까지에서 찾으며, Reverse Vth/Hysteresis 계산에는 사용하지 않고 gm 그래프의 진단용 peak 표시에만 사용합니다.",
-        )
-    with c2:
+    with s2:
         single_w = st.number_input("W (µm)", value=100.0, key="single_w")
         single_l = st.number_input("L (µm)", value=10.0, key="single_l")
+    with s3:
         single_epsr = st.number_input("εr", value=7.5, key="single_epsr")
-    with c3:
         single_tox = st.number_input("tox (nm)", value=35.0, key="single_tox")
         single_eps0 = st.number_input("ε0 (F/cm)", value=8.85e-14, format="%.3e", key="single_eps0")
         single_abs = st.checkbox("분석에는 |Id| 사용", value=True, key="single_abs")
-    with c4:
+    with s4:
         single_vg = st.text_input("Vg 열", "BV", key="single_vg")
         single_id = st.text_input("Id 열", "AI", key="single_id")
         single_ig = st.text_input("Ig 열", "BI", key="single_ig")
         single_vd = st.text_input("Vd 열", "AV", key="single_vd")
 
-    st.caption(
-        f"Single Reverse gm_max 탐색 범위: -10.0 V ~ {float(single_reverse_gm_end):.1f} V "
-        "(Reverse gm_max는 진단용 표시이며, primary Reverse Vth/Hysteresis에는 사용하지 않음)"
-    )
+    if single_file is not None:
+        st.caption(
+            "Batch와 동일하게 Vg/Id 열이 있는 가장 마지막 측정 Sheet를 자동 선택합니다. "
+            "결과표/그래프/Excel 형식도 Batch와 동일합니다."
+        )
+        # 파일이 바뀌면 이전 데이터 결과를 잘못 표시하지 않도록 합니다.
+        current_fingerprint = (
+            single_file.name, single_file.size,
+            hashlib.sha256(single_file.getvalue()).hexdigest(),
+        )
+        if st.session_state.single_payload is not None and st.session_state.single_payload.get("fingerprint") != current_fingerprint:
+            st.session_state.single_payload = None
+    else:
+        st.session_state.single_payload = None
+        current_fingerprint = None
 
-    if st.button("분석 실행", type="primary", key="single_run"):
+    if st.button("Single 분석 실행", type="primary", key="single_run"):
         if single_file is None:
-            st.warning("먼저 Excel 파일을 업로드하세요.")
-        elif not single_sheet:
-            st.warning("분석할 Sheet를 선택하세요.")
+            st.warning("먼저 분석할 Excel 파일 1개를 업로드하세요.")
         else:
             try:
                 with st.spinner("분석 중..."):
-                    results, frames, raw_df, header_row = analyze_single_file(
-                        single_file.getvalue(),
-                        single_sheet,
-                        col_vg=single_vg.strip(),
-                        col_id=single_id.strip(),
-                        col_ig=single_ig.strip(),
-                        col_vd=single_vd.strip(),
-                        smoothing_window=int(single_smooth),
+                    file_bytes = single_file.getvalue()
+                    sheet = find_default_measurement_sheet(
+                        file_bytes, single_vg.strip(), single_id.strip()
+                    )
+                    row, frames = analyze_batch_file(
+                        file_bytes, single_file.name, sheet,
+                        col_vg=single_vg.strip(), col_id=single_id.strip(),
+                        col_ig=single_ig.strip(), col_vd=single_vd.strip(),
+                        smoothing_window=int(single_smooth), ss_window=int(single_ss),
+                        constant_current_A=float(single_iref),
+                        use_abs_id=single_abs, W_um=float(single_w),
+                        L_um=float(single_l), eps_r=float(single_epsr),
+                        tox_nm=float(single_tox), eps0=float(single_eps0),
+                    )
+                    result_df = pd.DataFrame([row])
+                    curves = {
+                        f"001::{single_file.name}": overlay_curve_record(row, frames)
+                    }
+                    figs = make_batch_figures(curves, figsize=graph_figsize)
+                    excel_bytes = build_batch_excel(
+                        result_df, pd.DataFrame(),
+                        W_um=float(single_w), L_um=float(single_l),
+                        eps_r=float(single_epsr), tox_nm=float(single_tox),
+                        eps0=float(single_eps0), smoothing=int(single_smooth),
                         ss_window=int(single_ss),
                         constant_current_A=float(single_iref),
-                        reverse_gm_search_start_v=-10.0,
-                        reverse_gm_search_end_v=float(single_reverse_gm_end),
-                        use_abs_id=single_abs,
-                        W_um=float(single_w),
-                        L_um=float(single_l),
-                        eps_r=float(single_epsr),
-                        tox_nm=float(single_tox),
-                        eps0=float(single_eps0),
+                        col_vg=single_vg.strip(), col_id=single_id.strip(),
+                        col_ig=single_ig.strip(), col_vd=single_vd.strip(),
                     )
-                    figs = make_single_figures(results, frames, single_abs)
-                    excel_bytes = build_single_excel(
-                        single_file.name,
-                        single_sheet,
-                        results,
-                        frames,
-                        raw_df,
-                        W_um=float(single_w),
-                        L_um=float(single_l),
-                        eps_r=float(single_epsr),
-                        tox_nm=float(single_tox),
-                        use_abs_id=single_abs,
-                    )
-
-                    single_stem = Path(single_file.name).stem
-                    graph_zip_bytes = build_figures_zip(
+                    stem = Path(single_file.name).stem
+                    graph_zip = build_figures_zip(
                         figs,
                         [
-                            f"{single_stem}_Linear_Id_Vg.png",
-                            f"{single_stem}_Log_Id_Ig_Vg.png",
-                            f"{single_stem}_gm_Vg.png",
+                            f"{stem}_Linear_Id_Overlay.png",
+                            f"{stem}_Log_Id_Ig_Overlay.png",
+                            f"{stem}_gm_Forward.png",
                         ],
                         dpi=300,
                     )
-
                     st.session_state.single_payload = {
-                        "file_name": single_file.name,
-                        "sheet": single_sheet,
-                        "results": results,
-                        "frames": frames,
-                        "raw_df": raw_df,
-                        "header_row": header_row,
+                        "schema_version": ANALYSIS_SCHEMA_VERSION,
+                        "fingerprint": current_fingerprint,
+                        "results": result_df,
+                        "detected": pd.DataFrame([{
+                            "Device": row["Device"], "File": single_file.name,
+                            "Sheet": sheet, "Status": "Done",
+                        }]),
                         "figs": figs,
+                        "curves": curves,
+                        "graph_figsize": graph_figsize,
                         "excel": excel_bytes,
-                        "graph_zip": graph_zip_bytes,
+                        "graph_zip": graph_zip,
+                        "file_name": single_file.name,
                     }
             except Exception as e:
                 st.session_state.single_payload = None
@@ -1677,116 +1528,106 @@ with tab_single:
 
     single_payload = st.session_state.single_payload
     if single_payload is not None:
-        results = single_payload["results"]
-        st.success(
-            f"분석 완료 | Header: Excel {single_payload['header_row'] + 1}행 | "
-            f"데이터 {len(single_payload['raw_df'])} points"
+        # 그래프 비율 변경 시 기존 분석값은 유지하고 플롯/PNG만 다시 생성합니다.
+        if single_payload.get("graph_figsize") != graph_figsize:
+            single_payload["figs"] = make_batch_figures(
+                single_payload["curves"], figsize=graph_figsize
+            )
+            stem = Path(single_payload["file_name"]).stem
+            single_payload["graph_zip"] = build_figures_zip(
+                single_payload["figs"],
+                [
+                    f"{stem}_Linear_Id_Overlay.png",
+                    f"{stem}_Log_Id_Ig_Overlay.png",
+                    f"{stem}_gm_Forward.png",
+                ],
+                dpi=300,
+            )
+            single_payload["graph_figsize"] = graph_figsize
+
+        result_df = single_payload["results"].copy()
+        st.success("Single 완료 | 성공 1개 / 실패 0개")
+
+        with st.expander("파일별 자동 선택 Sheet 확인"):
+            st.dataframe(single_payload["detected"], use_container_width=True, hide_index=True)
+
+        st.caption("통계 사용 소자: 전체 1개 / 사용 1개 / 제외 0개 (N=1)")
+        # Batch와 완전히 같은 표 (단, 데이터 수 1개이므로 평균 = 그 소자 값).
+        st.markdown("#### Single 특성값 (Batch 평균값과 동일한 표 형식, N=1)")
+        st.dataframe(
+            make_batch_style_summary(result_df),
+            use_container_width=True, hide_index=True,
         )
 
-        if "Forward" in results and "Reverse" in results:
-            hys = abs(results["Reverse"]["Vth_V"] - results["Forward"]["Vth_V"])
-            f = results["Forward"]
-            r = results["Reverse"]
+        status_df = result_df.copy()
+        status_df.insert(1, "사용 여부", "사용")
+        st.dataframe(
+            format_batch_style_results(status_df),
+            use_container_width=True, hide_index=True,
+        )
 
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Vth F (gm-max)", f"{f['Vth_V']:.4f} V")
-            m2.metric(
-                "Vth R (same-current)",
-                f"{r['Vth_V']:.4f} V" if np.isfinite(r['Vth_V']) else "N/A",
+        with st.expander("특성값 분산 / 균일도 보기", expanded=False):
+            st.info("소자가 1개이므로 소자 간 표준편차·분산·CV 및 이상치 판정은 불가능합니다. Batch에서 여러 소자를 분석해 주세요.")
+            st.dataframe(
+                format_statistics_for_display(statistics_dataframe(result_df)),
+                use_container_width=True, hide_index=True,
             )
-            m3.metric(
-                "Hysteresis |R-F| (same-current)",
-                f"{hys:.4f} V" if np.isfinite(hys) else "N/A",
+            variation_metric = st.selectbox(
+                "분산 그래프로 볼 특성값",
+                options=list(VARIABILITY_METRICS.keys()),
+                key="single_variation_metric",
             )
-            m4.metric("SS F", f"{f['SS_mV_dec']:.2f} mV/dec" if np.isfinite(f['SS_mV_dec']) else "N/A")
-            m5.metric("μFE F", f"{f['mu_FE_cm2_Vs']:.3f} cm²/V·s" if np.isfinite(f['mu_FE_cm2_Vs']) else "N/A")
-
-            hys_cc = (
-                abs(r["Vth_CC_V"] - f["Vth_CC_V"])
-                if np.isfinite(r["Vth_CC_V"]) and np.isfinite(f["Vth_CC_V"])
-                else np.nan
+            variation_fig = make_variability_figure(
+                result_df, variation_metric, figsize=graph_figsize
             )
-            cc1, cc2, cc3 = st.columns(3)
-            cc1.metric(
-                "Vth constant-current F",
-                f"{f['Vth_CC_V']:.4f} V" if np.isfinite(f['Vth_CC_V']) else "N/A",
-            )
-            cc2.metric(
-                "Vth constant-current R",
-                f"{r['Vth_CC_V']:.4f} V" if np.isfinite(r['Vth_CC_V']) else "N/A",
-            )
-            cc3.metric(
-                "CC Hysteresis |R-F|",
-                f"{hys_cc:.4f} V" if np.isfinite(hys_cc) else "N/A",
+            display_centered_figure(variation_fig)
+            variation_png = figure_to_png_bytes(variation_fig, dpi=300)
+            safe_metric_name = variation_metric.replace("/", "_").replace(" ", "_").replace("μ", "mu")
+            st.download_button(
+                "분산 그래프 이미지 다운로드",
+                data=variation_png,
+                file_name=f"TFT_Single_Variation_{safe_metric_name}.png",
+                mime="image/png", key="single_variation_download",
             )
 
-        # 화면 표시용: 작은/큰 값은 과학적 표기법으로 보기 쉽게 표시
-        single_display_df = single_results_dataframe(results).copy()
-
-        single_sci_cols = [
-            "Iref (A)",
-            "Vth match current (A)",
-            "gm_max (S)",
-            "Id @ gm_max (A)",
-            "ON/OFF",
-            "Cox (F/cm²)",
-        ]
-        for col in single_sci_cols:
-            if col in single_display_df.columns:
-                single_display_df[col] = single_display_df[col].apply(fmt_sci)
-
-        single_fixed_formats = {
-            "Vth primary (V)": 4,
-            "Vth constant-current (V)": 4,
-            "SS (mV/dec)": 2,
-            "μFE (cm²/V·s)": 3,
-            "Vg @ gm_max (V)": 3,
-            "Vg step (V)": 3,
-            "Vd used (V)": 3,
-        }
-        for col, decimals in single_fixed_formats.items():
-            if col in single_display_df.columns:
-                single_display_df[col] = single_display_df[col].apply(
-                    lambda x, d=decimals: fmt_num(x, d)
-                )
-
-        st.dataframe(single_display_df, use_container_width=True, hide_index=True)
-
-        p1, p2, p3 = st.tabs(["Linear Id-Vg", "Log Id+Ig-Vg", "gm-Vg"])
-        with p1:
+        st.caption(
+            "gm, SS, Mobility, ON/OFF는 Forward만 분석합니다. "
+            "Reverse는 같은 전류의 Vth와 Hysteresis 계산에만 사용합니다. "
+            "Log 그래프의 F gm-max Vth(○)와 R same-current Vth(◆)는 같은 |Id|에서 점선으로 연결됩니다."
+        )
+        sp1, sp2, sp3 = st.tabs([
+            "Linear Id-Vg", "Log Id+Ig-Vg", "gm-Vg Forward",
+        ])
+        with sp1:
             display_centered_figure(single_payload["figs"][0])
-        with p2:
+        with sp2:
             display_centered_figure(single_payload["figs"][1])
-        with p3:
+        with sp3:
             display_centered_figure(single_payload["figs"][2])
 
         stem = Path(single_payload["file_name"]).stem
         dl1, dl2 = st.columns(2)
-
         with dl1:
             st.download_button(
-                "결과 Excel 다운로드",
+                "Single 결과 Excel 다운로드",
                 data=single_payload["excel"],
-                file_name=f"{stem}_TFT_analysis.xlsx",
+                file_name=f"{stem}_TFT_Analysis.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="single_download",
-                use_container_width=True,
+                key="single_download", use_container_width=True,
             )
-
         with dl2:
             st.download_button(
-                "그래프 이미지 다운로드",
+                "Single 그래프 이미지 다운로드",
                 data=single_payload["graph_zip"],
-                file_name=f"{stem}_TFT_graphs.zip",
-                mime="application/zip",
-                key="single_graph_download",
+                file_name=f"{stem}_TFT_Graphs.zip",
+                mime="application/zip", key="single_graph_download",
                 use_container_width=True,
             )
 
 
 # ------------------------- Batch -----------------------------
 with tab_batch:
-    st.subheader("Batch TFT Analyzer")
+    st.subheader("Batch Transistor Analyzer")
 
     upload_col, clear_col = st.columns([5, 1])
 
@@ -1832,16 +1673,6 @@ with tab_batch:
             value=1e-6,
             format="%.1e",
             key="batch_iref",
-        )
-        batch_reverse_gm_end = st.number_input(
-            "Reverse gm_max 탐색 끝 Vg (V)",
-            min_value=-10.0,
-            max_value=10.0,
-            value=8.0,
-            step=0.1,
-            format="%.1f",
-            key="batch_reverse_gm_end",
-            help="Reverse gm_max는 -10 V부터 이 값까지에서 찾으며, Reverse Vth/Hysteresis 계산에는 사용하지 않고 gm 그래프의 진단용 peak 표시에만 사용합니다.",
         )
     with b2:
         batch_w = st.number_input("W (µm)", value=100.0, key="batch_w")
@@ -1908,8 +1739,6 @@ with tab_batch:
                         smoothing_window=int(batch_smooth),
                         ss_window=int(batch_ss),
                         constant_current_A=float(batch_iref),
-                        reverse_gm_search_start_v=-10.0,
-                        reverse_gm_search_end_v=float(batch_reverse_gm_end),
                         use_abs_id=batch_abs,
                         W_um=float(batch_w),
                         L_um=float(batch_l),
@@ -1919,17 +1748,7 @@ with tab_batch:
                     )
                     rows.append(row)
                     detected_sheets.append({"Device": device_label, "File": uploaded.name, "Sheet": sheet, "Status": "Done"})
-                    curves[unique_file_key] = {
-                        "Device": row["Device"],
-                        "Forward": file_curves["Forward"],
-                        "Reverse": file_curves["Reverse"],
-                        "Vg_gmmax_F": row["Vg@gmmax F (V)"],
-                        "gmmax_F": row["gm_max F (S)"],
-                        "Vg_gmmax_R": row["Vg@gmmax R (V)"],
-                        "gmmax_R": row["gm_max R (S)"],
-                        "Reverse_gm_search_start": -10.0,
-                        "Reverse_gm_search_end": float(batch_reverse_gm_end),
-                    }
+                    curves[unique_file_key] = overlay_curve_record(row, file_curves)
                 except Exception as e:
                     errors.append({
                         "Device": device_label,
@@ -1946,7 +1765,7 @@ with tab_batch:
             if rows:
                 result_df = pd.DataFrame(rows)
                 errors_df = pd.DataFrame(errors)
-                figs = make_batch_figures(curves)
+                figs = make_batch_figures(curves, figsize=graph_figsize)
                 excel_bytes = build_batch_excel(
                     result_df,
                     errors_df,
@@ -1958,8 +1777,6 @@ with tab_batch:
                     smoothing=int(batch_smooth),
                     ss_window=int(batch_ss),
                     constant_current_A=float(batch_iref),
-                    reverse_gm_search_start_v=-10.0,
-                    reverse_gm_search_end_v=float(batch_reverse_gm_end),
                     col_vg=batch_vg.strip(),
                     col_id=batch_id.strip(),
                     col_ig=batch_ig.strip(),
@@ -1972,12 +1789,12 @@ with tab_batch:
                         "TFT_Batch_Linear_Id_Overlay.png",
                         "TFT_Batch_Log_Id_Ig_Overlay.png",
                         "TFT_Batch_gm_Forward.png",
-                        "TFT_Batch_gm_Reverse.png",
                     ],
                     dpi=300,
                 )
 
                 st.session_state.batch_payload = {
+                    "schema_version": ANALYSIS_SCHEMA_VERSION,
                     "results": result_df,
                     "errors": errors_df,
                     "curves": curves,
@@ -1988,6 +1805,7 @@ with tab_batch:
                 }
             else:
                 st.session_state.batch_payload = {
+                    "schema_version": ANALYSIS_SCHEMA_VERSION,
                     "results": pd.DataFrame(),
                     "errors": pd.DataFrame(errors),
                     "curves": {},
@@ -2014,41 +1832,8 @@ with tab_batch:
                 st.dataframe(batch_payload["detected"], use_container_width=True, hide_index=True)
 
         if success:
-            # ----------------------------------------------------
-            # 이전 버전(v8.4 이하) session_state 결과와의 호환성 보정
-            # v8.5에서 Hysteresis 열 이름을 |R-F| 표기로 변경했기 때문에
-            # 기존 세션의 DataFrame에 새 열이 없으면 여기서 자동 생성합니다.
-            # ----------------------------------------------------
+            # Schema v3: 이전 코드의 결과 캐시는 자동 무효화되므로 별도 열 이름 변환이 불필요합니다.
             result_df = result_df.copy()
-
-            hys_col = "Vth Hysteresis |R-F| (V)"
-            old_hys_col = "Vth Hysteresis R-F (V)"
-            if hys_col not in result_df.columns:
-                if old_hys_col in result_df.columns:
-                    result_df[hys_col] = pd.to_numeric(
-                        result_df[old_hys_col], errors="coerce"
-                    ).abs()
-                elif "Vth F (V)" in result_df.columns and "Vth R (V)" in result_df.columns:
-                    result_df[hys_col] = (
-                        pd.to_numeric(result_df["Vth R (V)"], errors="coerce")
-                        - pd.to_numeric(result_df["Vth F (V)"], errors="coerce")
-                    ).abs()
-
-            hys_cc_col = "Vth CC Hysteresis |R-F| (V)"
-            old_hys_cc_col = "Vth CC Hysteresis R-F (V)"
-            if hys_cc_col not in result_df.columns:
-                if old_hys_cc_col in result_df.columns:
-                    result_df[hys_cc_col] = pd.to_numeric(
-                        result_df[old_hys_cc_col], errors="coerce"
-                    ).abs()
-                elif "Vth CC F (V)" in result_df.columns and "Vth CC R (V)" in result_df.columns:
-                    result_df[hys_cc_col] = (
-                        pd.to_numeric(result_df["Vth CC R (V)"], errors="coerce")
-                        - pd.to_numeric(result_df["Vth CC F (V)"], errors="coerce")
-                    ).abs()
-
-            # 보정된 결과를 현재 세션에도 다시 저장
-            batch_payload["results"] = result_df
 
             # ----------------------------------------------------
             # Outlier filtering (원본 결과는 삭제하지 않음)
@@ -2154,111 +1939,17 @@ with tab_batch:
                 ),
             )
 
-            numeric_cols = [
-                "Vth F (V)", "Vth R (V)", "Vth Hysteresis |R-F| (V)",
-                "Vth match current (A)",
-                "Vth CC F (V)", "Vth CC R (V)", "Vth CC Hysteresis |R-F| (V)",
-                "gm_max F (S)", "gm_max R (S)",
-                "SS F (mV/dec)", "SS R (mV/dec)",
-                "muFE F (cm2/Vs)", "muFE R (cm2/Vs)",
-                "ON/OFF F", "ON/OFF R",
-                "Vg step (V)",
-            ]
-            avg = active_df[numeric_cols].apply(pd.to_numeric, errors="coerce").mean()
-
-            # Batch 평균값을 한눈에 보기 쉬운 표로 표시
             if excluded_devices:
                 st.markdown("#### Batch 평균값 (이상치 제외 후)")
             else:
                 st.markdown("#### Batch 평균값")
-
-            avg_table = pd.DataFrame([
-                {
-                    "특성값": "Vth (F gm-max / R same-current)",
-                    "Forward 평균": f"{avg['Vth F (V)']:.4f}",
-                    "Reverse 평균": f"{avg['Vth R (V)']:.4f}",
-                    "Hysteresis |R-F|": f"{avg['Vth Hysteresis |R-F| (V)']:.4f}",
-                    "단위": "V",
-                },
-                {
-                    "특성값": "Vth (Constant Current)",
-                    "Forward 평균": f"{avg['Vth CC F (V)']:.4f}",
-                    "Reverse 평균": f"{avg['Vth CC R (V)']:.4f}",
-                    "Hysteresis |R-F|": f"{avg['Vth CC Hysteresis |R-F| (V)']:.4f}",
-                    "단위": "V",
-                },
-                {
-                    "특성값": "SS",
-                    "Forward 평균": f"{avg['SS F (mV/dec)']:.2f}",
-                    "Reverse 평균": f"{avg['SS R (mV/dec)']:.2f}",
-                    "Hysteresis |R-F|": "-",
-                    "단위": "mV/dec",
-                },
-                {
-                    "특성값": "μFE",
-                    "Forward 평균": f"{avg['muFE F (cm2/Vs)']:.3f}",
-                    "Reverse 평균": f"{avg['muFE R (cm2/Vs)']:.3f}",
-                    "Hysteresis |R-F|": "-",
-                    "단위": "cm²/V·s",
-                },
-                {
-                    "특성값": "ON/OFF",
-                    "Forward 평균": f"{avg['ON/OFF F']:.6e}",
-                    "Reverse 평균": f"{avg['ON/OFF R']:.6e}",
-                    "Hysteresis |R-F|": "-",
-                    "단위": "-",
-                },
-            ])
-
             st.dataframe(
-                avg_table,
+                make_batch_style_summary(active_df),
                 use_container_width=True,
                 hide_index=True,
             )
 
-            display_cols = [
-                "Device", "사용 여부", "Sheet",
-                "Vth F (V)", "Vth R (V)", "Vth Hysteresis |R-F| (V)",
-                "Vth match current (A)",
-                "Vth CC F (V)", "Vth CC R (V)", "Vth CC Hysteresis |R-F| (V)",
-                "gm_max F (S)", "gm_max R (S)",
-                "SS F (mV/dec)", "SS R (mV/dec)",
-                "muFE F (cm2/Vs)", "muFE R (cm2/Vs)",
-                "ON/OFF F", "ON/OFF R",
-                "Vg step (V)",
-            ]
-            # 화면 표시용 표: gm / ON-OFF는 e 표기, 나머지는 필요한 소수점으로 정리
-            batch_display_df = result_df_with_status[display_cols].copy()
-
-            batch_sci_cols = [
-                "Vth match current (A)",
-                "gm_max F (S)",
-                "gm_max R (S)",
-                "ON/OFF F",
-                "ON/OFF R",
-            ]
-            for col in batch_sci_cols:
-                if col in batch_display_df.columns:
-                    batch_display_df[col] = batch_display_df[col].apply(fmt_sci)
-
-            batch_fixed_formats = {
-                "Vth F (V)": 4,
-                "Vth R (V)": 4,
-                "Vth Hysteresis |R-F| (V)": 4,
-                "Vth CC F (V)": 4,
-                "Vth CC R (V)": 4,
-                "Vth CC Hysteresis |R-F| (V)": 4,
-                "SS F (mV/dec)": 2,
-                "SS R (mV/dec)": 2,
-                "muFE F (cm2/Vs)": 3,
-                "muFE R (cm2/Vs)": 3,
-                "Vg step (V)": 3,
-            }
-            for col, decimals in batch_fixed_formats.items():
-                if col in batch_display_df.columns:
-                    batch_display_df[col] = batch_display_df[col].apply(
-                        lambda x, d=decimals: fmt_num(x, d)
-                    )
+            batch_display_df = format_batch_style_results(result_df_with_status)
 
             # 이상치로 제외된 소자는 결과표 전체 행을 연한 빨간색으로 강조
             def highlight_excluded_row(row):
@@ -2303,7 +1994,7 @@ with tab_batch:
                 )
 
                 variation_fig = make_variability_figure(
-                    active_df, selected_variation_metric
+                    active_df, selected_variation_metric, figsize=graph_figsize
                 )
                 display_centered_figure(variation_fig)
                 st.caption(
@@ -2326,9 +2017,9 @@ with tab_batch:
                 )
 
             st.caption(
-                f"Batch gm 그래프는 Forward와 Reverse를 분리해서 표시합니다. "
-                f"Reverse gm_max는 -10.0 V ~ {float(batch_reverse_gm_end):.1f} V 범위에서만 탐색하며, "
-                "Reverse gm_max는 진단용 peak 표시에만 사용하며, primary Reverse Vth/Hysteresis에는 사용하지 않습니다. Reverse μFE는 계산하지 않습니다."
+                "gm, SS, Mobility, ON/OFF는 Forward만 계산합니다. "
+                "Reverse는 같은 전류의 Vth와 Hysteresis 계산에만 사용합니다. "
+                "Log 그래프에는 Forward gm-max Vth(○)와 동일 전류 Reverse Vth(◆)를 점선으로 연결했습니다."
             )
 
             active_device_names = set(active_df["Device"].astype(str))
@@ -2337,13 +2028,12 @@ with tab_batch:
                 for key, item in batch_payload["curves"].items()
                 if str(item.get("Device", "")) in active_device_names
             }
-            active_figs = make_batch_figures(active_curves)
+            active_figs = make_batch_figures(active_curves, figsize=graph_figsize)
 
-            bp1, bp2, bp3, bp4 = st.tabs([
+            bp1, bp2, bp3 = st.tabs([
                 "Linear Id-Vg",
                 "Log Id+Ig-Vg",
                 "gm-Vg Forward",
-                "gm-Vg Reverse",
             ])
             with bp1:
                 display_centered_figure(active_figs[0])
@@ -2351,8 +2041,6 @@ with tab_batch:
                 display_centered_figure(active_figs[1])
             with bp3:
                 display_centered_figure(active_figs[2])
-            with bp4:
-                display_centered_figure(active_figs[3])
 
             active_excel_bytes = build_batch_excel(
                 active_df,
@@ -2367,8 +2055,6 @@ with tab_batch:
                 smoothing=int(batch_smooth),
                 ss_window=int(batch_ss),
                 constant_current_A=float(batch_iref),
-                reverse_gm_search_start_v=-10.0,
-                reverse_gm_search_end_v=float(batch_reverse_gm_end),
                 col_vg=batch_vg.strip(),
                 col_id=batch_id.strip(),
                 col_ig=batch_ig.strip(),
@@ -2381,7 +2067,6 @@ with tab_batch:
                     "TFT_Batch_Linear_Id_Overlay.png",
                     "TFT_Batch_Log_Id_Ig_Overlay.png",
                     "TFT_Batch_gm_Forward.png",
-                    "TFT_Batch_gm_Reverse.png",
                 ],
                 dpi=300,
             )
